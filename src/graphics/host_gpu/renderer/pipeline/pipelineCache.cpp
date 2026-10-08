@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -49,6 +50,9 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -286,6 +290,21 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
+}
+
+// The reader of a stage walked in the parallel window (StagePrepWorker): bytes no GPU work has
+// written, from the backing store, and nothing else: no download, no fault, no wait for the GPU.
+// A read it cannot serve fails the walk, which the GPU thread then repeats on the exact path.
+bool ReadShaderGuestMemoryProbe(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
+	    cache != nullptr && cache->Read(address, values)) {
+		return true;
+	}
+	return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	                                                       values.size_bytes());
 }
 
 // "VS", "PS", ... for zone texts.
@@ -595,6 +614,208 @@ private:
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_queue;
 	std::vector<std::thread>                             m_threads;
 	bool                                                 m_stopped = false;
+};
+
+// Graphics shader translation on worker threads (plan.md P1; KYTY_ASYNC_TRANSLATION=0 translates
+// every shader on the GPU thread, as before). A new shader's translation (decode, CFG, IR,
+// resource tracking) took ~85 ms on the GPU thread, and an effect brings dozens: the first
+// Square slash in the jungle stopped the emulated GPU for 2-3 s, a new area for minutes. The
+// translation depends only on the code and the stage inputs, never on guest memory or the draw's
+// user data values (the disk cache's source key holds the same), so a worker can do it while the
+// draw is skipped; the materialization and the SPIR-V that need guest memory stay on the GPU
+// thread. Only draws with the depth test on are deferred (GetGraphicsPrograms): UI and layer
+// draws, which a game may draw once, translate at once, as their pipelines compile at once.
+// Compute always translates at once: a skipped dispatch can leave data unwritten.
+static const bool g_async_translation = [] {
+	const char* value = std::getenv("KYTY_ASYNC_TRANSLATION");
+	return value == nullptr || value[0] != '0';
+}();
+
+struct TranslationJob {
+	std::vector<uint32_t>                code;
+	std::vector<uint32_t>                back_code;
+	std::vector<uint32_t>                user_data;
+	ShaderVertexInputInfo                vertex {};
+	ShaderPixelInputInfo                 pixel {};
+	ShaderRecompiler::CompileOptions     options;
+	ShaderRecompiler::TranslateResult    result;
+	std::chrono::steady_clock::time_point queued;
+	std::atomic<bool>                    done {false};
+};
+
+class TranslationWorkers {
+public:
+	explicit TranslationWorkers(uint32_t threads) {
+		for (uint32_t i = 0; i < threads; i++) {
+			m_threads.emplace_back([this] { Run(); });
+		}
+	}
+	~TranslationWorkers() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stopped = true;
+			m_queue.clear();
+		}
+		m_work.notify_all();
+		for (auto& thread: m_threads) {
+			thread.join();
+		}
+	}
+	KYTY_CLASS_NO_COPY(TranslationWorkers);
+
+	void Submit(std::shared_ptr<TranslationJob> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_queue.push_back(std::move(job));
+		}
+		m_work.notify_one();
+	}
+
+private:
+	void Run() {
+		KYTY_PROFILER_THREAD("ShaderTranslator");
+		for (;;) {
+			std::shared_ptr<TranslationJob> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
+				if (m_queue.empty()) {
+					return;
+				}
+				job = std::move(m_queue.front());
+				m_queue.pop_front();
+			}
+			job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+			job->done.store(true, std::memory_order_release);
+		}
+	}
+
+	std::mutex                                  m_mutex;
+	std::condition_variable                     m_work;
+	std::deque<std::shared_ptr<TranslationJob>> m_queue;
+	std::vector<std::thread>                    m_threads;
+	bool                                        m_stopped = false;
+};
+
+// Vertex and pixel SRT refresh in parallel (plan.md P10, after Jetsku's draw-prep S3, c7c4da45).
+// The SRT refresh is a third of the GPU thread in the jungle, and a draw's two stages walk
+// independent plans into independent snapshots. In a short window per draw, this helper walks the
+// vertex stage while the GPU thread walks the pixel stage; both only read bytes no GPU work has
+// written (ReadShaderGuestMemoryProbe), so neither downloads, faults or waits, and nothing changes
+// the GPU-written state the other reads. A walk that fails there (a byte the GPU wrote, memory
+// not mapped) is repeated by the GPU thread on the exact path, as before. The helper spins
+// KYTY_STAGE_PREP_SPIN_US (default 250) after its last job, then sleeps; a draw never waits for a
+// sleeping helper, it wakes it for the next. Off by default: in the jungle a window took ~7 us,
+// because the helper's walk runs on cold caches and the GPU thread waits for it, which cost more
+// than the walk it saved (Tracy, 2026-10-07). KYTY_STAGE_PREP_PARALLEL=1 turns it on;
+// KYTY_STAGE_PREP_VERIFY=1 repeats each parallel walk on the exact path and logs differences.
+static const bool g_stage_prep_parallel = [] {
+	const char* value = std::getenv("KYTY_STAGE_PREP_PARALLEL");
+	return value != nullptr && value[0] == '1';
+}();
+
+inline void StagePrepPause() {
+#if defined(__x86_64__) || defined(_M_X64)
+	_mm_pause();
+#else
+	std::this_thread::yield();
+#endif
+}
+
+class StagePrepWorker {
+public:
+	using Job = void (*)(void* context);
+
+	StagePrepWorker() {
+		const char* spin = std::getenv("KYTY_STAGE_PREP_SPIN_US");
+		m_spin           = std::chrono::microseconds(spin != nullptr ? std::atoi(spin) : 250);
+		m_thread         = std::thread([this] { Run(); });
+	}
+	~StagePrepWorker() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_stop_flag.store(true, std::memory_order_release);
+		m_wake.notify_one();
+		m_thread.join();
+	}
+	KYTY_CLASS_NO_COPY(StagePrepWorker);
+
+	// Hands the job to the helper; false when it sleeps (it is woken for the next draw) or is
+	// still busy, and the caller does the work itself.
+	bool Post(Job job, void* context) {
+		if (m_sleeping.load(std::memory_order_acquire)) {
+			{
+				std::lock_guard lock(m_mutex);
+				m_wake_requested = true;
+			}
+			m_wake.notify_one();
+			return false;
+		}
+		if (m_state.load(std::memory_order_acquire) != Idle) {
+			return false;
+		}
+		m_job     = job;
+		m_context = context;
+		m_state.store(Posted, std::memory_order_release);
+		return true;
+	}
+
+	// Waits for the posted job; false when the helper never started it (taken back).
+	bool Join() {
+		uint32_t expected = Posted;
+		if (m_state.compare_exchange_strong(expected, Idle, std::memory_order_acq_rel)) {
+			return false;
+		}
+		while (m_state.load(std::memory_order_acquire) != Done) {
+			StagePrepPause();
+		}
+		m_state.store(Idle, std::memory_order_release);
+		return true;
+	}
+
+private:
+	enum : uint32_t { Idle, Posted, Running, Done };
+
+	void Run() {
+		KYTY_PROFILER_THREAD("StagePrep");
+		Common::PreferPerformanceCores("stage preparation helper");
+		Libs::LibKernel::Memory::SetGpuReadDelegate(true);
+		auto last_job = std::chrono::steady_clock::now();
+		while (!m_stop_flag.load(std::memory_order_acquire)) {
+			uint32_t expected = Posted;
+			if (m_state.load(std::memory_order_acquire) == Posted &&
+			    m_state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) {
+				m_job(m_context);
+				m_state.store(Done, std::memory_order_release);
+				last_job = std::chrono::steady_clock::now();
+				continue;
+			}
+			if (std::chrono::steady_clock::now() - last_job < m_spin) {
+				StagePrepPause();
+				continue;
+			}
+			std::unique_lock lock(m_mutex);
+			m_sleeping.store(true, std::memory_order_release);
+			m_wake.wait(lock, [this] { return m_wake_requested || m_stop; });
+			m_wake_requested = false;
+			m_sleeping.store(false, std::memory_order_release);
+			last_job = std::chrono::steady_clock::now();
+		}
+	}
+
+	std::atomic<uint32_t>     m_state {Idle};
+	Job                       m_job     = nullptr;
+	void*                     m_context = nullptr;
+	std::atomic<bool>         m_sleeping {false};
+	std::atomic<bool>         m_stop_flag {false};
+	std::mutex                m_mutex;
+	std::condition_variable   m_wake;
+	bool                      m_wake_requested = false;
+	bool                      m_stop           = false;
+	std::chrono::microseconds m_spin {250};
+	std::thread               m_thread;
 };
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -935,9 +1156,19 @@ struct PipelineCache::ProgramCache {
 					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
 				}
 				t_srt_shader_hash = params.hash;
-				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
-				    entry->second.resource_plan, runtime, entry->second.resources,
-				    entry->second.specialization);
+				bool materialized = false;
+				if (TakePrepared(&entry->second)) {
+					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
+					static const bool verify = std::getenv("KYTY_STAGE_PREP_VERIFY") != nullptr;
+					materialized             = true;
+					if (verify) {
+						VerifyPrepared(entry->second, runtime, stage, params.hash);
+					}
+				} else {
+					materialized = ShaderRecompiler::IR::MaterializeResources(
+					    entry->second.resource_plan, runtime, entry->second.resources,
+					    entry->second.specialization);
+				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
 				runtime.gpu_fills   = nullptr;
@@ -986,6 +1217,17 @@ struct PipelineCache::ProgramCache {
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
+			}
+		}
+
+		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
+		if (!translating.empty()) {
+			if (const auto job = translating.find(lookup_key);
+			    job != translating.end() && !job->second->done.load(std::memory_order_acquire)) {
+				translation_skips++;
+				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
+				                                StageLabel(stage), params.hash);
+				return ShaderProgram {};
 			}
 		}
 
@@ -1110,7 +1352,44 @@ struct PipelineCache::ProgramCache {
 		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
-		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		ShaderRecompiler::TranslateResult translated;
+		if (const auto job = translating.find(lookup_key); job != translating.end()) {
+			// Done (the check above returned while it was not): take the worker's translation.
+			const auto waited = std::chrono::duration<double, std::milli>(
+			                        std::chrono::steady_clock::now() - job->second->queued)
+			                        .count();
+			if (translations_done++ < 32) {
+				LOGF("ShaderTranslator: %s 0x%016" PRIx64 " ready after %.0f ms, %" PRIu64
+				     " draws skipped so far while translating\n",
+				     stage_name, params.hash, waited, translation_skips);
+			}
+			translated = std::move(job->second->result);
+			translating.erase(job);
+		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
+			auto job = std::make_shared<TranslationJob>();
+			job->code.assign(compile_code.begin(), compile_code.end());
+			job->back_code.assign(params.back_code.begin(), params.back_code.end());
+			job->user_data.assign(user_data.begin(), user_data.end());
+			job->options           = options;
+			job->options.user_data = job->user_data;
+			job->options.back_code = job->back_code;
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				job->vertex                   = input_info;
+				job->options.input_info.vertex = &job->vertex;
+			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+				job->pixel                   = input_info;
+				job->options.input_info.pixel = &job->pixel;
+			}
+			job->queued = std::chrono::steady_clock::now();
+			translating.emplace(lookup_key, job);
+			translators->Submit(std::move(job));
+			translation_skips++;
+			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
+			                                StageLabel(stage), params.hash);
+			return ShaderProgram {};
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		}
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
@@ -1200,6 +1479,19 @@ struct PipelineCache::ProgramCache {
 		} else {
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
+		if (g_async_translation) {
+			// KYTY_TRANSLATION_THREADS=<n> (default 2).
+			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
+			const auto  threads = std::max<uint32_t>(
+			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+			translators = std::make_unique<TranslationWorkers>(threads);
+			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
+			                 threads);
+		}
+		if (g_stage_prep_parallel) {
+			stage_prep = std::make_unique<StagePrepWorker>();
+			PipelineCacheLog("Stage preparation: vertex and pixel SRT refresh in parallel");
+		}
 	}
 
 	void FlushDisk() {
@@ -1252,6 +1544,146 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
+	std::unordered_map<ProgramKey, std::shared_ptr<TranslationJob>, ProgramKeyHash> translating;
+	uint64_t                                                    translation_skips = 0;
+	uint64_t                                                    translations_done = 0;
+	// Set by GetGraphicsPrograms for the draw at hand: may its shaders translate in the background?
+	bool                                                        defer_translation = false;
+	// The entries whose snapshot the parallel window refreshed for the draw at hand
+	// (PrepareStagesInParallel); Get takes them instead of walking again.
+	std::array<SourceEntry*, 2>                                 prepared {};
+	ProgramKey                                                  prep_key;
+	uint64_t                                                    prep_windows    = 0;
+	uint64_t                                                    prep_vs_ok      = 0;
+	uint64_t                                                    prep_ps_ok      = 0;
+	uint64_t                                                    prep_declined   = 0;
+	uint64_t                                                    prep_mismatches = 0;
+	std::unique_ptr<StagePrepWorker>                            stage_prep;
+	// Last: destroyed first, so its threads have stopped before anything else goes.
+	std::unique_ptr<TranslationWorkers>                         translators;
+
+	// A stage's program entry as Get would find it, or null (not translated yet, skipped).
+	template <typename InputInfo>
+	SourceEntry* FindForPrep(const ShaderParams& params, const InputInfo& input_info,
+	                         ShaderType stage) {
+		if (SkipShaderRequested(params.hash)) {
+			return nullptr;
+		}
+		prep_key.stage           = stage;
+		prep_key.hash            = params.hash;
+		prep_key.user_data_count = params.user_data_count;
+		prep_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, prep_key.static_state);
+		prep_key.function_code.clear();
+		const auto entry = programs.find(prep_key);
+		return entry != programs.end() ? &entry->second : nullptr;
+	}
+
+	// The SRT refresh of Get with the probe reader (ReadShaderGuestMemoryProbe).
+	static bool WalkProbe(SourceEntry& entry, const ShaderParams& params) {
+		GuestPageReadCache               cache;
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryProbe,
+		    .userdata                   = &cache,
+		    .read_specialization_memory = ReadShaderGuestMemoryProbe,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+			return static_cast<GuestPageReadCache*>(userdata)->Map(page);
+		};
+		runtime.page_userdata = &cache;
+		runtime.page_shift    = 12;
+		return ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
+		                                                  entry.resources, entry.specialization);
+	}
+
+	// The parallel window of a draw (StagePrepWorker): the helper refreshes the vertex stage while
+	// this thread refreshes the pixel stage. Both entries must exist already.
+	void PrepareStagesInParallel(const ShaderParams& ps_params, const ShaderPixelInputInfo& ps_info,
+	                             const ShaderParams&          vs_params,
+	                             const ShaderVertexInputInfo& vs_info) {
+		prepared = {};
+		if (stage_prep == nullptr) {
+			return;
+		}
+		auto* ps = FindForPrep(ps_params, ps_info, ShaderType::Pixel);
+		if (ps == nullptr) {
+			return;
+		}
+		auto* vs = FindForPrep(vs_params, vs_info, vs_info.logical_stage);
+		if (vs == nullptr || vs == ps) {
+			return;
+		}
+		struct Context {
+			SourceEntry*        entry;
+			const ShaderParams* params;
+			bool                ok;
+		} job {vs, &vs_params, false};
+		KYTY_PROFILER_BLOCK("StagePrep::Window");
+		if (!stage_prep->Post(
+		        [](void* context) {
+			        auto& job = *static_cast<Context*>(context);
+			        job.ok    = WalkProbe(*job.entry, *job.params);
+		        },
+		        &job)) {
+			prep_declined++;
+			return;
+		}
+		const bool ps_ok = WalkProbe(*ps, ps_params);
+		const bool vs_ok = stage_prep->Join() && job.ok;
+		prep_windows++;
+		prep_ps_ok += ps_ok ? 1u : 0u;
+		prep_vs_ok += vs_ok ? 1u : 0u;
+		prepared = {ps_ok ? ps : nullptr, vs_ok ? vs : nullptr};
+		if ((prep_windows & (prep_windows - 1u)) == 0u && prep_windows >= 1024u) {
+			LOGF("Stage preparation: %" PRIu64 " parallel windows, pixel walks served %" PRIu64
+			     ", vertex walks served %" PRIu64 ", %" PRIu64 " declined (helper asleep or "
+			     "busy), %" PRIu64 " verify mismatches\n",
+			     prep_windows, prep_ps_ok, prep_vs_ok, prep_declined, prep_mismatches);
+		}
+	}
+
+	bool TakePrepared(const SourceEntry* entry) {
+		for (auto& slot: prepared) {
+			if (slot == entry && entry != nullptr) {
+				slot = nullptr;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// KYTY_STAGE_PREP_VERIFY=1: the exact walk again after a parallel one, compared.
+	void VerifyPrepared(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                    ShaderType stage, uint64_t hash) {
+		const auto resources      = entry.resources;
+		const auto specialization = entry.specialization;
+		if (!ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
+		                                                entry.resources, entry.specialization)) {
+			return;
+		}
+		const auto& fresh = entry.resources;
+		if (resources.flattened_srt == fresh.flattened_srt && resources.buffers == fresh.buffers &&
+		    resources.images == fresh.images && resources.samplers == fresh.samplers &&
+		    specialization == entry.specialization) {
+			return;
+		}
+		if (prep_mismatches++ < 32) {
+			LOGF("Stage preparation: verify mismatch %s 0x%016" PRIx64 " (flat %d, buffers %d, "
+			     "images %d, samplers %d, specialization %d)\n",
+			     StageLabel(stage), hash,
+			     static_cast<int>(resources.flattened_srt != fresh.flattened_srt),
+			     static_cast<int>(resources.buffers != fresh.buffers),
+			     static_cast<int>(resources.images != fresh.images),
+			     static_cast<int>(resources.samplers != fresh.samplers),
+			     static_cast<int>(!(specialization == entry.specialization)));
+		}
+	}
+
+	void SetDeferTranslation(bool value) { defer_translation = value; }
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1559,6 +1991,21 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	// New shaders of 3D draws (depth test on) translate on the workers while the draw is skipped;
+	// UI and layer draws translate at once (TranslationWorkers).
+	struct DeferScope {
+		ProgramCache& cache;
+		~DeferScope() { cache.SetDeferTranslation(false); }
+	} defer_scope {*m_program_cache};
+	m_program_cache->SetDeferTranslation(context.GetDepthControl().z_enable);
+	struct PreparedScope {
+		ProgramCache& cache;
+		~PreparedScope() { cache.prepared = {}; }
+	} prepared_scope {*m_program_cache};
+	if (pixel_active && !tess_active) {
+		m_program_cache->PrepareStagesInParallel(pixel_params, pixel_info, vertex_params[0],
+		                                         vertex_info[0]);
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -1569,6 +2016,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	return result;
+}
+
+bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
+	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

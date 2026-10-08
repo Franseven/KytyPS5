@@ -88,6 +88,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
+	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
@@ -184,6 +186,14 @@ private:
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
+	// Guest reads UploadCopies leaves to the recording thread: staging destination, guest
+	// address, bytes.
+	struct UploadRead {
+		uint8_t* destination;
+		uint64_t address;
+		uint64_t size;
+	};
+	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;

@@ -43,8 +43,20 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// SEC_COMMIT charged all of guest direct memory (13.5 GB) to the system commit limit at
+		// boot, before the game had mapped any of it (ISSUES #21: with a small page file the
+		// emulator could not start, or ran out of commit later). The section is reserved
+		// instead, and each range is committed when the guest first maps it (EnsureCommitted);
+		// a page committed through the alias below is committed in every view of the section.
+		// KYTY_LAZY_COMMIT=0 commits everything up front as before.
+		m_lazy_commit = [] {
+			const char* value = std::getenv("KYTY_LAZY_COMMIT");
+			return value == nullptr || value[0] != '0';
+		}();
+		m_committed.assign((m_size + CommitGranule * 64u - 1u) / (CommitGranule * 64u), 0u);
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr,
+		    PAGE_EXECUTE_READWRITE | (m_lazy_commit ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -103,6 +115,7 @@ public:
 		for (const auto& [_, entry]: m_maps) {
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
@@ -115,6 +128,7 @@ public:
 			EXIT_IF(
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
@@ -161,6 +175,22 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_lazy_commit) {
+			// Pages not committed yet are zero when they are; touching them would fault.
+			std::lock_guard lock(m_commit_mutex);
+			const auto      end = backing_offset + size;
+			for (auto offset = backing_offset; offset < end;) {
+				const auto granule_end =
+				    std::min(end, (offset / CommitGranule + 1u) * CommitGranule);
+				if (IsCommittedUnlocked(offset / CommitGranule)) {
+					std::memset(m_backing_base + offset, 0, granule_end - offset);
+				}
+				offset = granule_end;
+			}
+			return true;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -192,10 +222,42 @@ public:
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return nullptr;
 		}
+		// The GPU thread's SRT walks ask for every guest page they read (GuestPageReadCache),
+		// tens of thousands of times a frame, and each took this lock and a map lookup. A thread
+		// remembers its recent mappings until the mapping table changes (m_maps_generation).
+		// KYTY_BACKING_CACHE=0 looks up every time.
+		struct Cached {
+			const GuestBackingStore* owner      = nullptr;
+			uint64_t                 generation = 0;
+			uint64_t                 vaddr      = 0;
+			uint64_t                 size       = 0;
+			uint64_t                 offset     = 0;
+		};
+		static const bool cache_enabled = [] {
+			const char* value = std::getenv("KYTY_BACKING_CACHE");
+			return value == nullptr || value[0] != '0';
+		}();
+		thread_local std::array<Cached, 8> cache {};
+		thread_local uint32_t              cache_next = 0;
+		if (cache_enabled) {
+			const auto generation = m_maps_generation.load(std::memory_order_acquire);
+			for (const auto& cached: cache) {
+				if (cached.owner == this && cached.generation == generation &&
+				    vaddr >= cached.vaddr && vaddr + size <= cached.vaddr + cached.size) {
+					const auto offset = cached.offset + vaddr - cached.vaddr;
+					return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+				}
+			}
+		}
 		std::lock_guard lock(m_mutex);
 		MapEntry        entry {};
 		if (!FindContainingUnlocked(vaddr, size, &entry)) {
 			return nullptr;
+		}
+		if (cache_enabled) {
+			cache[cache_next++ % cache.size()] = {this,
+			                                      m_maps_generation.load(std::memory_order_acquire),
+			                                      entry.vaddr, entry.size, entry.backing_offset};
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
@@ -254,6 +316,7 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		EnsureCommitted(backing_offset, size);
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -265,6 +328,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -276,6 +340,7 @@ public:
 			return false;
 		}
 		RemoveMappingsUnlocked(vaddr, size);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -363,6 +428,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 					m_maps.erase(entry);
 #endif
 				}
@@ -383,6 +449,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -427,6 +494,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -525,12 +593,15 @@ private:
 				++it;
 				continue;
 			}
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			it = m_maps.erase(it);
 			if (old.vaddr < vaddr) {
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr,
 				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
 			}
 			if (end < old_end) {
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(end, MapEntry {end, old_end - end,
 				                             old.backing_offset + end - old.vaddr, old.mode});
 			}
@@ -561,6 +632,51 @@ private:
 	[[nodiscard]] bool RangeOk(uint64_t backing_offset, uint64_t size) const {
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static constexpr uint64_t CommitGranule = 64u * 1024u;
+
+	[[nodiscard]] bool IsCommittedUnlocked(uint64_t granule) const {
+		return (m_committed[granule / 64u] >> (granule % 64u) & 1u) != 0;
+	}
+
+	// Commits the backing pages of [backing_offset, +size) that are not committed yet; see the
+	// constructor. Ends the emulator with a clear message when the system is out of commit.
+	void EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+		if (!m_lazy_commit || size == 0) {
+			return;
+		}
+		std::lock_guard lock(m_commit_mutex);
+		const auto      first = backing_offset / CommitGranule;
+		const auto      last  = (backing_offset + size - 1u) / CommitGranule;
+		for (auto granule = first; granule <= last;) {
+			if (IsCommittedUnlocked(granule)) {
+				granule++;
+				continue;
+			}
+			auto run_end = granule + 1u;
+			while (run_end <= last && !IsCommittedUnlocked(run_end)) {
+				run_end++;
+			}
+			const auto offset = granule * CommitGranule;
+			const auto bytes  = std::min(run_end * CommitGranule, m_size) - offset;
+			if (VirtualAlloc(m_backing_base + offset, bytes, MEM_COMMIT, PAGE_READWRITE) ==
+			    nullptr) {
+				EXIT("Out of memory: Windows could not commit %" PRIu64
+				     " MB of guest memory (error 0x%08" PRIx32 ", %" PRIu64
+				     " MB committed so far).\nClose other programs or enlarge the page file "
+				     "(System > About > Advanced system settings > Performance > Virtual "
+				     "memory).\n",
+				     bytes >> 20u, static_cast<uint32_t>(GetLastError()),
+				     (m_committed_bytes) >> 20u);
+			}
+			m_committed_bytes += bytes;
+			for (; granule < run_end; granule++) {
+				m_committed[granule / 64u] |= uint64_t {1} << (granule % 64u);
+			}
+		}
+	}
+#endif
 
 	static void SetFailure(FailureReason* out, FailureReason reason) {
 		if (out != nullptr) {
@@ -672,6 +788,14 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Changes with every change of m_maps, made under m_mutex (FindBacking's thread caches).
+	std::atomic<uint64_t>        m_maps_generation {1};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool                  m_lazy_commit     = false;
+	std::mutex            m_commit_mutex;
+	std::vector<uint64_t> m_committed; // one bit per CommitGranule of the backing
+	uint64_t              m_committed_bytes = 0;
+#endif
 };
 
 class GuestAddressSpace {
