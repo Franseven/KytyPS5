@@ -162,12 +162,21 @@ public:
 		cache.ProcessFaultBuffer();
 		scheduler.Finish();
 		RangeSet ranges;
-		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& source = bindings.buffer_sources[i];
-			if (!program.info.buffers[i].written || source.size == 0) continue;
-			const auto start = source.address & ~uint64_t {3};
-			const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
-			ranges.Add(start, end - start);
+		// buffer_sources holds one entry per memory-offset slot, not one per program.info.buffers
+		// entry: AllocateBindings keeps only the live buffers, so the two differ as soon as a shader
+		// has a dead descriptor and indexing buffer_sources by program.info.buffers reads past its
+		// end. The garbage range then reached BufferCache::FindBuffer, which exits on an invalid one
+		// (Demon's Souls, a compute dispatch with a dead V#).
+		const auto& layout = program.bindings;
+		if (layout.memory_offset_count != 0) {
+			const auto& resources = layout.descriptors.front().resources;
+			for (size_t i = 0; i < resources.size(); ++i) {
+				const auto& source = bindings.buffer_sources[i];
+				if (!program.info.buffers[resources[i]].written || source.size == 0) continue;
+				const auto start = source.address & ~uint64_t {3};
+				const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
+				ranges.Add(start, end - start);
+			}
 		}
 		ranges.ForEach([&](uint64_t start, uint64_t end) {
 			const auto id = cache.FindBuffer(start, end - start);
