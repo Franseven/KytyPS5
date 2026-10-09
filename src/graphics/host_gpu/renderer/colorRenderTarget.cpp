@@ -71,8 +71,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
-	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	// NUM_SAMPLES and NUM_FRAGMENTS are both log2 counts; a standard multisampled target has them
+	// equal, and an EQAA one does not -- GT7 draws into a samples=2 / fragments=1 colour target
+	// (4 coverage samples, 2 storing ones) and pairs it with a samples=1 depth target, because
+	// under EQAA the depth surface is stored per fragment. Vulkan has no coverage-only samples, so
+	// the fragment count is the level that can be expressed, and it is the one the depth target of
+	// the same render pass already uses: taking it here is what keeps the pass legal. A target with
+	// no fragment count at all (fragments=0) is not EQAA and keeps its sample count.
+	const auto sample_log2 = rt.attrib.num_fragments != 0 ? rt.attrib.num_fragments
+	                                                      : rt.attrib.num_samples;
+	const auto samples     = render_sample_count(sample_log2);
+	if (samples == 0) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
@@ -201,7 +210,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (samples == 1) {
 		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 	} else {
-		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
+		pitch = TileGetRenderTargetPitch(width, bytes_per_element, sample_log2);
 	}
 	if (pitch == 0) {
 		EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
@@ -237,7 +246,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			                levels <= std::bit_width(std::max(width, height)));
 		} else {
 			valid_layout = TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
-			                                       layout, rt.attrib.num_fragments);
+			                                       layout, sample_log2);
 			mip_sizes[0]  = {layout.size, 0, 0, 0, 0, 0};
 			mip_padded[0] = {pitch, height};
 		}
@@ -282,7 +291,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		const auto layers = volume ? depth : view.image_layers;
 		if (has_dcc) {
 			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
-			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
+			                     rt.attrib3.tile_mode, metadata_size, sample_log2);
 			desc.info.metadata.dcc_alpha_msb = DccAlphaOnMsb(rt.info);
 		} else {
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);

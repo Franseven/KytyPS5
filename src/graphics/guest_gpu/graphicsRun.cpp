@@ -917,7 +917,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		if (remaining_dw < 2) {
+			// One dword left is too short for any packet: a type-0 or type-3 header without its
+			// body, and a type-2 NOP, which is padding and carries no length. Games do leave a
+			// final word behind the last real packet, and nothing can be done with it -- consume
+			// it and end the buffer rather than lose a run that has already drawn its frames.
+			static std::atomic<uint32_t> tail_log_count {0};
+			if (tail_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				printf("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32 "\n", packet[0],
+				       total_dw - remaining_dw);
+			}
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if ((packet_header >> 30u) == 0u) {
 			// A type-0 packet writes COUNT+1 registers from a base index; the command processor

@@ -2433,7 +2433,18 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		return 2;
 	}
 
-	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	// GT7 (PPSA01317) names a shader register past the end of the table a few seconds after its menu
+	// finishes loading, and EXIT_NOT_IMPLEMENTED here ended the process at that point on every tree
+	// tried -- including this one, which is the only tree that gets GT7 into the game at all. The
+	// packet is still well-formed, so read past it, the way CpOpIndirectShRegs already does for an
+	// offset it cannot handle. Reported rather than silent: an offset that turns out to matter must
+	// stay visible.
+	if (cmd_offset >= Pm4::SH_NUM) {
+		if (static std::atomic<uint32_t> reported {0}; reported.fetch_add(1) < 32u) {
+			printf("Unhandled shader register 0x%05" PRIx32 " (>= SH_NUM)\n", cmd_offset);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 

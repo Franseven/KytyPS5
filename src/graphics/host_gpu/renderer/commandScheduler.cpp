@@ -622,31 +622,45 @@ void CommandScheduler::EnableRecordingThread() {
 }
 
 void* CommandScheduler::Allocate(size_t size, size_t alignment) {
-	EXIT_IF(!m_threaded || size > Chunk::Size);
-	const auto take = [this] {
+	EXIT_IF(!m_threaded || alignment == 0);
+	const auto take = [this](size_t minimum) {
 		std::lock_guard lock(m_record_mutex);
-		if (m_free_chunks.empty()) {
-			return std::make_unique<Chunk>();
+		for (auto it = m_free_chunks.begin(); it != m_free_chunks.end(); ++it) {
+			if ((*it)->capacity >= minimum) {
+				auto chunk = std::move(*it);
+				m_free_chunks.erase(it);
+				return chunk;
+			}
 		}
-		auto chunk = std::move(m_free_chunks.back());
-		m_free_chunks.pop_back();
-		return chunk;
+		return std::make_unique<Chunk>(std::max(minimum, Chunk::Size));
 	};
 	if (m_chunk == nullptr) {
-		m_chunk = take();
+		m_chunk = take(size);
 	}
 	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
-	if (offset + size > Chunk::Size) {
+	if (offset + size > m_chunk->capacity) {
 		DispatchChunk();
-		m_chunk = take();
+		m_chunk = take(size);
 		offset  = 0;
+	}
+	if (size > Chunk::Size) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("CommandScheduler: recorded array of %zu bytes needs an oversized chunk\n",
+			            size);
+		}
 	}
 	m_chunk->used = offset + size;
 	return m_chunk->storage + offset;
 }
 
 void CommandScheduler::DispatchChunk() {
-	if (m_chunk == nullptr || m_chunk->first == nullptr) {
+	// A chunk with no commands can still carry the stashed arrays of a command recorded after it:
+	// Allocate splits a command from its arrays whenever the arrays do not fit, and only a chunk
+	// with nothing in it at all can be dropped. Dropping an arrays-only one frees memory the
+	// command still reads -- the driver then executes a barrier list made of recycled heap and
+	// faults inside itself.
+	if (m_chunk == nullptr || (m_chunk->first == nullptr && m_chunk->used == 0)) {
 		return;
 	}
 	{
@@ -681,7 +695,10 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::PreferPerformanceCores("Vulkan recording thread");
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
-	// recycled only after the next two have run.
+	// recycled only after the chunks that can still reference them have run. One recorder call
+	// stashes at most three arrays (pipelineBarrier2) before recording its command, so a span of
+	// 8 leaves room for the recorder to grow without turning into a use-after-free.
+	static constexpr size_t RetainChunks = 8;
 	std::deque<std::unique_ptr<Chunk>> retained;
 	for (;;) {
 		std::unique_ptr<Chunk> chunk;
@@ -705,7 +722,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 		chunk->used  = 0;
 		retained.push_back(std::move(chunk));
 		std::unique_ptr<Chunk> recycled;
-		if (retained.size() > 2) {
+		if (retained.size() > RetainChunks) {
 			recycled = std::move(retained.front());
 			retained.pop_front();
 		}

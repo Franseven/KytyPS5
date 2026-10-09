@@ -579,10 +579,9 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		// The range is named before the exit: a caller that derives it wrongly (a slot list indexed
 		// by the wrong one, a size the guest never wrote) is otherwise indistinguishable from here.
-		LOGF("BufferCache: invalid buffer discovery request vaddr=0x%016" PRIx64
+		EXIT("BufferCache: invalid buffer discovery request vaddr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
-		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {

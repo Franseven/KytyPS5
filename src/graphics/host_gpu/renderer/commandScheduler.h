@@ -196,10 +196,21 @@ private:
 	};
 	struct Chunk {
 		static constexpr size_t Size = 256 * 1024;
-		alignas(64) std::byte storage[Size];
-		size_t           used  = 0;
-		RecordedCommand* first = nullptr;
-		RecordedCommand* last  = nullptr;
+		// The chunk is sized per allocation instead of fixed. Commands and the arrays they carry
+		// share this allocator, and one array can outgrow a regular chunk by itself: a
+		// copyBufferToImage of a few thousand regions is a single Stash at 56 bytes each. An
+		// allocation larger than its chunk gets a chunk that large; it is not an error.
+		explicit Chunk(size_t bytes = Size)
+		    : capacity(bytes),
+		      storage(static_cast<std::byte*>(::operator new(bytes, std::align_val_t {64}))) {}
+		~Chunk() { ::operator delete(storage, std::align_val_t {64}); }
+		Chunk(const Chunk&)            = delete;
+		Chunk& operator=(const Chunk&) = delete;
+		size_t           capacity;
+		std::byte*       storage = nullptr;
+		size_t           used    = 0;
+		RecordedCommand* first   = nullptr;
+		RecordedCommand* last    = nullptr;
 	};
 	void* Allocate(size_t size, size_t alignment);
 	void  DispatchChunk();

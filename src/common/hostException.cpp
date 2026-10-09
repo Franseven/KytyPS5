@@ -1,7 +1,11 @@
 #include "common/hostException.h"
 
+#include "common/assert.h"
+
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
+#include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -279,6 +283,28 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// The last resort, and the only report a fault that never reaches the vectored handler gets: one
+// raised inside that handler, or one the handler declines. It runs with the process already
+// terminating, so it prints the host stack and nothing else -- there is no guest state left to
+// describe safely by this point.
+static LONG WINAPI UnhandledFaultFilter(PEXCEPTION_POINTERS exception) noexcept {
+	const auto* record = exception != nullptr ? exception->ExceptionRecord : nullptr;
+	if (record != nullptr) {
+		std::printf("--- Unhandled host fault ---\n"
+		            "code=0x%08" PRIx32 " pc=0x%016" PRIx64 " fault=0x%016" PRIx64 "\n",
+		            static_cast<uint32_t>(record->ExceptionCode),
+		            reinterpret_cast<uint64_t>(record->ExceptionAddress),
+		            record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0);
+	}
+	std::printf("%s", Common::HostBacktrace().c_str());
+	std::fflush(stdout);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#endif
+
 bool InstallHandler(Handler handler) {
 	if (handler == nullptr) {
 		return false;
@@ -292,6 +318,10 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Behind the vectored handler, never instead of it: a fault that handler cannot classify (an
+	// access-violation subtype it does not know, or one raised while it is itself running) would
+	// otherwise terminate the process with an exit code and no report at all.
+	SetUnhandledExceptionFilter(UnhandledFaultFilter);
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);

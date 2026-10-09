@@ -114,6 +114,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		}
 	}
 	if (result != vk::Result::eSuccess) {
+		// Name the request before the memory report. A vmaCreateBuffer against a heap with 18 GB
+		// still free is a size problem, not a shortage, and the size is the one number the heap
+		// dump does not carry -- the caller is in the host stack printed just below.
+		printf("Buffer::Buffer failed: result=%d size=0x%016" PRIx64 " usage=%d"
+		       " cpu_address=0x%016" PRIx64 "\n",
+		       static_cast<int>(result), size, static_cast<int>(usage), cpu_address);
 		graphics.LogMemoryBudget();
 		EXIT("Out of memory: a %" PRIu64 " MB GPU buffer fits neither in video memory nor in system "
 		     "memory (%s). The VMA heap lines above give usage and budget. Close other programs; on "

@@ -538,6 +538,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	// Unbuffered, and set before anything else can print. When the output is redirected (the
+	// launcher's warm-up process, the A/B scripts, any crash capture) stdout is block buffered and
+	// up to 4 KB of it -- an entire fatal report, which is written by the fault handler and never
+	// followed by a flush when the process dies abnormally -- is discarded with the process. One
+	// write per line is free next to the work each line describes.
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	std::setvbuf(stderr, nullptr, _IONBF, 0);
+
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)

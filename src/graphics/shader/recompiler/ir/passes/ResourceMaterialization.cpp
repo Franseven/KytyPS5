@@ -2198,9 +2198,25 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			// Enumerated candidates only sample; a bindless image is loaded per instruction and
-			// serves every image operation.
-			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			// serves every image operation. Gran Turismo 7 reaches a root image with an opcode
+			// that is not ImageSampleRaw, which this used to reject by ending the process. Reported
+			// and kept instead: the resource is emitted through the ordinary direct path, which is
+			// what it would get if the root marker were not set at all. If a wrong descriptor is
+			// what comes out of that, the marker is what has to move -- not this check.
+			if (image.indirect_root == memory.resource && !image.bindless &&
+			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("ResourceMaterialization: root image %u used by opcode %u\n",
+					            memory.resource, static_cast<uint32_t>(inst.GetOpcode()));
+				}
+				// The marker is cleared rather than merely tolerated. The emitter picks the
+				// table-root path from this field alone (spirvEmitterImage.cpp), so leaving it set
+				// while the check above states this use is not a sample is what would leave the two
+				// halves disagreeing about the same descriptor -- a shader reading a table header
+				// as if it were the image. Cleared, every consumer takes the direct-image path.
+				images[memory.resource].indirect_root = ImageResource::NoIndirectImage;
+			}
 		}
 	}
 	// Tracking gives an image index only to the accesses that survived its dead-code pass; an
