@@ -208,6 +208,9 @@ enum class StageInputKind {
 	PrimitiveId,
 	TessCoord,
 	InstanceIndex,
+	// The draw's start instance, as Vulkan's BaseInstance: v8 holds the instance id counted from
+	// zero, and the shader that wants the absolute index adds this.
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,
@@ -444,6 +447,56 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// The runtime word of a buffer descriptor (ShaderBufferResource): what a portable module reads
+// instead of the value the specialization baked. Its fields, low to high:
+//   [0,12)  stride, when below 4096 and not swizzled (a larger one stays in the specialization)
+//   [12,16) layout of a formatted buffer's elements: 0-11 byte-aligned components (count - 1 in
+//           the low two bits, log2 of the component bytes in the high two), 12 11_11_10,
+//           13 10_11_11, 14 2_10_10_10, 15 10_10_10_2
+//   [16,19) Format::ComponentType of the elements (0: unknown format, raw dwords)
+//   [20,32) dst_sel
+struct BufferWord {
+	static constexpr uint32_t StrideBits    = 12;
+	static constexpr uint32_t MaxStride     = (1u << StrideBits) - 1u;
+	static constexpr uint32_t LayoutShift   = 12;
+	static constexpr uint32_t TypeShift     = 16;
+	static constexpr uint32_t DstSelShift   = 20;
+	static constexpr uint32_t PackedLayouts = 12;
+};
+
+// Portable shader modules (KYTY_PORTABLE_SHADERS; read once, fixed for the process): what a module
+// could only get from the descriptors the game binds at run time (a buffer's stride and format) no
+// longer selects one, so a program's modules can be compiled ahead from the game files. Buffers
+// take those values from their buffer words (BufferWord) in the shader data.
+bool PortableShaders();
+
+// The add-tid bit of a buffer's packed stride: the address's thread id (BufferAddTidBit).
+inline constexpr uint32_t BufferAddTidBit = 1u << 20u;
+
+// Bisect switches for the two halves of the portable path: KYTY_PORTABLE_STRIDE=0 and
+// KYTY_PORTABLE_FORMAT=0 each turn one half off, so an artefact can be attributed to the stride side
+// or to the format side. Both are read once and fixed for the process. RuntimeBufferStride and
+// RuntimeBufferFormat are the only places the halves are asked about, so every caller (the layout,
+// the address, the format decode) sees the same answer and the buffer words cannot desynchronize.
+bool PortableStride();
+bool PortableFormat();
+
+// With buffer words, a buffer whose stride its code reads at run time: not swizzled (the swizzled
+// address takes the stride apart) and at most MaxStride.
+[[nodiscard]] bool RuntimeBufferStride(uint32_t packed_stride);
+
+// With buffer words, a formatted buffer whose format its code can decode at run time: one it only
+// loads from (stores pack with the specialized format). Its specialization chooses: the V#'s format
+// and dst_sel give the fast specialized decode, kInvalid and the default dst_sel (PortableFormats)
+// the decode of whatever the buffer word says.
+[[nodiscard]] bool RuntimeBufferFormat(const BufferResource& buffer);
+
+// With buffer words, a buffer whose word a portable module reads: a stride (RuntimeBufferStride) or a
+// format and dst_sel (RuntimeBufferFormat) the specialization left open — PortableFormats clears the
+// descriptor format to kInvalid exactly for the latter. The layout and the emitter both ask this
+// question, so the words the layout reserves and the words the emitter loads cannot disagree.
+[[nodiscard]] bool UsesBufferWord(const BufferResource& buffer);
+
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct DescriptorBinding {
 	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
@@ -458,14 +511,18 @@ struct BindingLayout {
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	uint32_t                       buffer_word_count = 0; // one per buffer (BufferWord), or none
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t BufferWordDword() const {
 		return BufferLengthDword() + memory_offset_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return BufferWordDword() + buffer_word_count;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

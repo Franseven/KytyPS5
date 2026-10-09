@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -144,6 +145,164 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
 	return true;
 }
+
+} // namespace
+
+// Portable-module entry points. Other translation units reach these (BindingLayout.cpp,
+// descriptors.cpp), so they stay outside the anonymous namespace above.
+// KYTY_PORTABLE_SHADERS, read once and fixed for the process.
+bool PortableShaders() {
+	// Off by default: the portable path currently misrenders (flat white/black, wrong geometry) in
+	// Demon's Souls — the buffer word the host supplies looks correct, so the defect is inside the
+	// runtime decode/emit. Bisected with KYTY_PORTABLE_SHADERS=1 against =0 on the same build and
+	// cache: 1 shows the artefact, 0 does not. Its only purpose is one module per program instead of
+	// one per draw, which matters for precompiling offline — not reachable here. KYTY_PORTABLE_SHADERS=1
+	// turns it back on for A/B and for finishing the fix.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PORTABLE_SHADERS");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// One of the two bisect switches: on unless the variable is exactly "0".
+static bool PortableHalf(const char* name) {
+	const char* value = std::getenv(name);
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+bool PortableStride() {
+	static const bool enabled = PortableHalf("KYTY_PORTABLE_STRIDE");
+	return enabled;
+}
+
+bool PortableFormat() {
+	static const bool enabled = PortableHalf("KYTY_PORTABLE_FORMAT");
+	return enabled;
+}
+
+bool RuntimeBufferStride(uint32_t packed_stride) {
+	if (!PortableStride()) {
+		return false;
+	}
+	const auto stride = packed_stride & 0x3fffu;
+	return (stride == 0u || ((packed_stride >> 14u) & 1u) == 0u) &&
+	       stride <= BufferWord::MaxStride;
+}
+
+bool RuntimeBufferFormat(const BufferResource& buffer) {
+	return PortableFormat() && buffer.formatted && !buffer.written;
+}
+
+bool UsesBufferWord(const BufferResource& buffer) {
+	return RuntimeBufferStride(buffer.packed_stride) ||
+	       (RuntimeBufferFormat(buffer) &&
+	        buffer.descriptor_format == Prospero::BufferFormat::kInvalid);
+}
+
+uint32_t BufferFormatClass(Prospero::BufferFormat format) {
+	const auto info = Format::GetFormatInfo(format);
+	if (info.type == Format::ComponentType::Unknown) {
+		return 0;
+	}
+	uint32_t layout = 0;
+	if (!info.packed_bitfield) {
+		const auto bytes = info.component_bits[0] / 8u;
+		layout = (static_cast<uint32_t>(std::countr_zero(bytes)) << 2u) | (info.component_count - 1u);
+	} else if (info.component_count == 3u) {
+		layout = BufferWord::PackedLayouts + (info.component_bits[0] == 11u ? 0u : 1u);
+	} else {
+		layout = BufferWord::PackedLayouts + (info.component_bits[0] == 2u ? 2u : 3u);
+	}
+	return layout | static_cast<uint32_t>(info.type) << (BufferWord::TypeShift - BufferWord::LayoutShift);
+}
+
+uint32_t BufferDescriptorWord(const DescriptorValue& value) {
+	ShaderBufferResource descriptor;
+	// Raw dwords (Type() != 0) take the specialized path, so a word of 0 never reaches a decode.
+	if (!DecodeBufferDescriptor(value, descriptor) || descriptor.Type() != 0) {
+		return 0;
+	}
+	const uint32_t stride = descriptor.Stride() <= BufferWord::MaxStride ? descriptor.Stride() : 0u;
+	return stride | BufferFormatClass(descriptor.Format()) << BufferWord::LayoutShift |
+	       descriptor.DstSelXYZW() << BufferWord::DstSelShift;
+}
+
+// The format side of the buffer word, i.e. the classes whose runtime decode renders correctly:
+// packed layouts and byte-aligned ones whose components are at least two bytes.
+//
+// ponytail: a byte-aligned format of 1-byte components keeps its specialized decode. Measured on
+// Demon's Souls 2026-10-09, cold cache, KYTY_PORTABLE_SHADERS=1: the language select renders with
+// its 4- and 2-byte formats portable (KYTY_PORTABLE_FMT_BITS=16, 149 colours) and goes black with
+// its 1-byte ones (KYTY_PORTABLE_FMT_BITS=8, 58 — the flat-white/black artefact). The formats in
+// play are Unorm8x4 and Uint8; the runtime decode reads the same bits the specialized one does, so
+// its defect for a 1-byte component is elsewhere and wants its own bisect. Cost: one module per
+// format instead of one per draw, for 1-byte formats only. Add them once that defect is found.
+bool PortableFormatClass(Prospero::BufferFormat format) {
+	// The smallest component a byte-aligned format may have and still go portable. Lowering it with
+	// KYTY_PORTABLE_FMT_BITS is the counterfactual above: 8 turns the screen black again.
+	static const uint32_t min_bits = [] {
+		const char* value = std::getenv("KYTY_PORTABLE_FMT_BITS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 16u;
+	}();
+	const auto info = Format::GetFormatInfo(format);
+	return info.type != Format::ComponentType::Unknown &&
+	       (info.packed_bitfield || info.component_bits[0] >= min_bits);
+}
+
+bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization) {
+	bool changed = false;
+	if (!PortableShaders()) {
+		return changed;
+	}
+	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
+		auto& buffer = specialization.buffers[i];
+		if (!RuntimeBufferFormat(info.buffers[i]) ||
+		    (buffer.descriptor_format == Prospero::BufferFormat::kInvalid &&
+		     buffer.descriptor_swizzle == DstSel(4, 5, 6, 7))) {
+			continue;
+		}
+		// The format being classified is the one the V# materialized, i.e. the specialization's own:
+		// the plan's info carries it only when the shader declares it statically.
+		if (!PortableFormatClass(buffer.descriptor_format)) {
+			continue;
+		}
+		buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
+		buffer.descriptor_swizzle = DstSel(4, 5, 6, 7);
+		changed                   = true;
+	}
+	return changed;
+}
+
+void CanonicalizeSpecialization(const ResourcePlan& program, ResourceSpecialization& specialization) {
+	if (!PortableShaders()) {
+		return;
+	}
+	// A format the module decodes at run time (PortableFormats) is not a permutation either, and
+	// the module was already compiled without it, so only the record catches up.
+	PortableFormats(program.info, specialization);
+	for (size_t i = 0; i < specialization.buffers.size() && i < program.info.buffers.size(); i++) {
+		auto& buffer = specialization.buffers[i];
+		if (!RuntimeBufferStride(buffer.packed_stride)) {
+			continue;
+		}
+		// A stride the code reads from the buffer word is not a permutation: one module serves every
+		// stride. Everything else in the word stays: the add-tid bit still selects the address's
+		// thread id, and a store to an indirect descriptor is skipped when the stride is 0
+		// (spirvEmitterMemory.cpp, StoreWord), so zeroing that stride would drop the store and
+		// change the code. An indirect descriptor keeps its stride and its own permutation.
+		const auto& info = program.info.buffers[i];
+		if (buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+		    buffer.indirect_mapping_offset != 0u ||
+		    (info.source < program.descriptor_sources.size() &&
+		     program.descriptor_sources[info.source].indirect_descriptor.has_value())) {
+			continue;
+		}
+		buffer.packed_stride &= ~0x3fffu;
+	}
+}
+
+namespace {
 
 struct ReadCapture {
 	SrtRuntime                                  source;
@@ -1769,6 +1928,10 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	                                 runtime.float_image_atomics)) {
 		return FailIndirect(__LINE__);
 	}
+	// One place, and the only one: the specialization selects the permutation, so what a portable
+	// module reads at run time is merged away here, and the draw and anything compiling ahead from
+	// this plan see the same one.
+	CanonicalizeSpecialization(program, specialization);
 	served = trace.FullyServed();
 	trace.Succeeded();
 	return true;

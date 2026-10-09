@@ -886,6 +886,12 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// The GS user SGPR at an SH register location, -1 for another register.
+static int32_t GsUserSgprAt(uint32_t location) {
+	const auto id = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
+	return id < 32u ? static_cast<int32_t>(id) : -1;
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -961,6 +967,22 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
+		}
+
+		// The CP writes an indirect draw's start instance into the user SGPR the packet names
+		// (START_INST_LOC); the shader translation reads it to tell the draw's instances apart.
+		switch (opcode) {
+			case Pm4::IT_DRAW_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			case Pm4::IT_DRAW_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				m_sh_ctx.SetStartInstanceUserSgpr(GsUserSgprAt(packet[3] & 0xffffu));
+				break;
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DISPATCH_DRAW_PREAMBLE: m_sh_ctx.SetStartInstanceUserSgpr(-1); break;
+			default: break;
 		}
 
 		auto handler = g_cp_op_func[opcode];

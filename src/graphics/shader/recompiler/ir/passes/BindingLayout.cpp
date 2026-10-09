@@ -1,10 +1,12 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -125,6 +127,18 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	const auto shared = CollectMemoryResources(program, buffers);
 	CollectShaderData(program, next);
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	// Portable modules read a buffer's stride or format from its word (ShaderIR.h, BufferWord), so the
+	// buffers whose code does get one: contiguous from slot 0 up to the highest of them.
+	// ponytail: a high slot still costs a word each; a compact resource -> slot list would pay only
+	// for the portable ones, at the price of a second array the emitter would have to index.
+	if (PortableShaders()) {
+		for (uint32_t i = 0; i < next.memory_offset_count; i++) {
+			if (buffers[i] < program.info.buffers.size() &&
+			    UsesBufferWord(program.info.buffers[buffers[i]])) {
+				next.buffer_word_count = i + 1u;
+			}
+		}
+	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

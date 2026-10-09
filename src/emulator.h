@@ -13,6 +13,9 @@ struct RunOptions {
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
 	std::filesystem::path game_patch;
+	// --precompile: translate every shader the game's own files hold and fill _ShaderCache, then
+	// exit, without running the game (Offline::EnumerateGame + PipelineCache::SeedOffline).
+	bool precompile = false;
 };
 
 void Run(const RunOptions& options);

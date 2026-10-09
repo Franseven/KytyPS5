@@ -48,6 +48,8 @@ public:
 signals:
 
 	void Run();
+	// Same as Run(), but asks about precompilation even for a title that was told to stop asking.
+	void RunWithPrecompile();
 	void Select();
 	void PreviewControllerColor(const QString& color);
 

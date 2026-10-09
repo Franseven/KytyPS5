@@ -604,6 +604,9 @@ struct VertexShaderInfo {
 	GsStageRegisters gs_regs;
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
+	// The SGPR index (within the GS user data) a draw names as its start-instance location, or -1.
+	// IT_DRAW_INDIRECT and friends name one; the direct draw packets have no start instance.
+	int32_t          start_instance_user_sgpr = -1;
 };
 
 struct PixelShaderInfo {
@@ -1056,6 +1059,7 @@ public:
 		m_vs.gs_user_sgpr.count =
 		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
 	}
+	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

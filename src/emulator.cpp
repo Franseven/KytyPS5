@@ -11,7 +11,9 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/ShaderOffline.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -28,6 +30,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace Emulator {
 
@@ -168,6 +172,66 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// --precompile: every shader the game's own files hold (Offline::EnumerateGame), brought to the
+// point where a draw would hand it to the compiler, translated and stored in _ShaderCache by the
+// draw's own path (PipelineCache::SeedOffline). The device is the one the game would have got:
+// Libs::Graphics::Initialize ran in Init, before any of this.
+//
+// The shaders a game draws are a subset of the ones its files hold, and a draw whose own state
+// differs from the offline stand-ins (ShaderOffline.h) compiles as it does today, so this is a
+// head start and never a correctness question. The line per shader is machine readable: the
+// launcher counts the SHADERS line for its denominator and the PROGRESS lines for the bar.
+static void PrecompileShaders(const std::filesystem::path& game) {
+	auto* cache = Libs::Graphics::WindowPipelineCache();
+	EXIT_IF(cache == nullptr);
+
+	std::string report;
+	const auto  shaders = Libs::Graphics::Offline::EnumerateGame(game, report);
+	::printf("SHADERS\t%zu\n%s", shaders.size(), report.c_str());
+	::fflush(stdout);
+
+	// A container may carry a shader another one already carries: the emulator knows a shader by
+	// XXH3 of its code alone, so the first copy of a hash stands for all of them. (Ceiling: two
+	// containers holding the same code with *different* headers seed only the first, and a draw
+	// using the other misses and compiles as it does today. Demon's Souls has 20954 distinct of
+	// 47858.) The progress denominator is the distinct count, which is what has to be translated.
+	std::unordered_set<uint64_t>                             seen;
+	std::vector<const Libs::Graphics::Offline::ShaderBlob*>  distinct;
+	distinct.reserve(shaders.size());
+	for (const auto& blob: shaders) {
+		if (seen.insert(Libs::Graphics::Offline::ShaderHash(blob)).second) {
+			distinct.push_back(&blob);
+		}
+	}
+	::printf("DISTINCT\t%zu\n", distinct.size());
+	::fflush(stdout);
+
+	size_t seeded  = 0;
+	size_t skipped = 0;
+	for (size_t i = 0; i < distinct.size(); i++) {
+		Libs::Graphics::Offline::Program program;
+		std::string                      note;
+		std::string                      failure;
+		const auto status = Libs::Graphics::Offline::PrepareOfflineProgram(*distinct[i], program, note,
+		                                                                  failure);
+		const bool ok = status == Libs::Graphics::Offline::Status::Ok && cache->SeedOffline(program);
+		if (ok) {
+			seeded++;
+		} else {
+			skipped++;
+		}
+		::printf("PROGRESS\t%zu\t%zu\t%s\n", i + 1, distinct.size(), ok ? "seeded" : "skipped");
+		::fflush(stdout);
+	}
+	cache->Save();
+	::printf("PRECOMPILED\t%zu\t%zu\n", seeded, skipped);
+	::fflush(stdout);
+
+	// As the game path does after WindowRun: the cache is flushed and nothing is left to unwind in
+	// order. (Letting the subsystems destruct here hangs with the device still up.)
+	std::quick_exit(0);
+}
+
 static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
@@ -191,6 +255,10 @@ void Run(const RunOptions& options) {
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
+	if (options.precompile) {
+		// The graphics subsystem creates the window during Init; this run never shows it.
+		Libs::Graphics::WindowSetHidden();
+	}
 	Init(options.config, param_json, subsystems);
 
 	ClearDebugTextureFolder();
@@ -203,6 +271,13 @@ void Run(const RunOptions& options) {
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
+
+	if (options.precompile) {
+		// The subsystems and the window unwind in the ordinary order as Run returns: nothing here
+		// needs the quick exit the guest path takes.
+		PrecompileShaders(options.app0_dir);
+		return;
+	}
 
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);

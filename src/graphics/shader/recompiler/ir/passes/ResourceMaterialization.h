@@ -60,6 +60,29 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
 
+// The buffer word (BufferWord) of a materialized V#: what a portable module reads instead of the
+// stride and format the specialization baked. 0 when the descriptor is not a buffer one.
+uint32_t BufferDescriptorWord(const DescriptorValue& descriptor);
+
+// A buffer format's layout and component type as a buffer word holds them (bits 0-6 of the word
+// shifted right by BufferWord::LayoutShift); 0 for a format without them.
+uint32_t BufferFormatClass(Prospero::BufferFormat format);
+
+// Whether the runtime format decode covers a format: true for packed formats and byte-aligned ones
+// with 4-byte components, the classes the emitted decode was bisected onto. A false here keeps the
+// format specialized (one module per format), which PortableFormats is the only caller of.
+bool PortableFormatClass(Prospero::BufferFormat format);
+
+// The portable form of a specialization (PortableShaders): the formatted buffers the code only
+// loads from decode the format of their buffer words (RuntimeBufferFormat) instead of the V#'s, so
+// one module serves every format. False when that leaves the specialization unchanged.
+bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization);
+
+// Merges the specializations the module provably cannot tell apart, so a record made before the
+// merge canonicalizes to the permutation the game now selects. The plan is what says whether a
+// buffer's stride reaches the emitted code at all.
+void CanonicalizeSpecialization(const ResourcePlan& program, ResourceSpecialization& specialization);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

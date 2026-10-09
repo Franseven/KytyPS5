@@ -535,6 +535,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
 		case IR::StageInputKind::TessCoord: return spv::BuiltInTessCoord;
 		case IR::StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
+		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		case IR::StageInputKind::FragCoord: return spv::BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
@@ -595,6 +596,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::InvocationId:
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::BaseInstance:
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
@@ -623,6 +625,11 @@ void DefineInputs(EmitterState& state) {
 				}
 				break;
 			default: break;
+		}
+		// gl_BaseInstance is a DrawParameters built-in: without the capability the module fails
+		// spirv-val ("Operand 3 of Decorate requires one of these capabilities: DrawParameters").
+		if (input.kind == IR::StageInputKind::BaseInstance) {
+			state.builder.RequireCapability(spv::CapabilityDrawParameters);
 		}
 		input.variable_id =
 		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());

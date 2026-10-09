@@ -155,6 +155,9 @@ struct ShaderVertexInputInfo {
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
+	// SGPR the draw names as its start-instance location, or -1 when the draw has none. The vertex
+	// shader reads the instance id from zero and the absolute index from gl_BaseInstance.
+	int32_t                 start_instance_sgpr = -1;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;

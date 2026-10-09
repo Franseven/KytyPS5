@@ -24,10 +24,12 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 #include <filesystem>
@@ -152,8 +154,14 @@ struct EventController {
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+// WindowSetHidden: the offline precompiler's window is never shown (no event loop runs in it).
+bool g_hidden = false;
 
 } // namespace
+
+void WindowSetHidden() {
+	g_hidden = true;
+}
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 
@@ -801,6 +809,9 @@ uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
+	if (g_hidden) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 	return flags;
 }
 
@@ -820,9 +831,30 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	return presenter;
 }
 
+PipelineCache* WindowPipelineCache() {
+	if (g_window == nullptr || g_window->render_context == nullptr) {
+		return nullptr;
+	}
+	return &g_window->render_context->GetPipelineCache();
+}
+
 void WindowRun() {
 	KYTY_PROFILER_THREAD("Thread_Window");
 	EXIT_IF(g_window == nullptr);
+
+	if (const auto seconds = Config::ExitAfterSeconds(); seconds != 0) {
+		// The loop below blocks in SDL_WaitEventTimeout with no timeout, so a clock check at the
+		// top of it would only fire once some other event arrived. Pushing the quit event wakes
+		// the wait and takes the ordinary close-the-window path, which is what flushes the caches.
+		LOGF("WindowRun(): will quit on its own after %u seconds\n",
+		     static_cast<unsigned>(seconds));
+		std::thread([seconds] {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			SDL_Event quit {};
+			quit.type = SDL_EVENT_QUIT;
+			SDL_PushEvent(&quit);
+		}).detach();
+	}
 
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());

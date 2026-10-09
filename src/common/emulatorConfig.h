@@ -81,6 +81,10 @@ struct ConfigOptions {
 	bool                   float_image_atomics_enabled = true;
 	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
 	std::string            skip_shader_hashes;
+	// Shader compilation and translation workers. 0 keeps the built-in automatic count.
+	uint32_t               shader_workers     = 0;
+	// Quit on its own after this many seconds, the same way closing the window does. 0 = never.
+	uint32_t               exit_after_seconds = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -133,6 +137,8 @@ bool TessellationEnabled();
 bool TrophyEnabled();
 bool BindlessImagesEnabled();
 const std::string& GetSkipShaderHashes();
+uint32_t ShaderWorkers();
+uint32_t ExitAfterSeconds();
 bool FloatImageAtomicsEnabled();
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

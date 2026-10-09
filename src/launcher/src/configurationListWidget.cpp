@@ -1150,6 +1150,9 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	// The only way back once "do not ask again" is stored for a title.
+	QAction* action_run_precompile =
+	    menu.addAction(tr("Run, ask about precompilation..."), this, SIGNAL(RunWithPrecompile()));
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));

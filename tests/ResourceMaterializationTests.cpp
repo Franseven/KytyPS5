@@ -581,6 +581,72 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// Two draws that differ only in the stride of a buffer whose code reads it at run time must end up
+// with the same specialization, or they compile the same program twice (ShaderIR.h, BufferWord).
+void TestCanonicalizeSpecializationFoldsPortableStride() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  ResourcePlan plan;
+  plan.info.buffers.resize(4);
+  plan.info.buffers[0].packed_stride = 16;
+  plan.info.buffers[1].packed_stride = 4;
+  // Swizzled: the address takes the stride apart, so the code cannot read it from the word.
+  plan.info.buffers[2].packed_stride = (32u | (1u << 14u));
+  // An indirect descriptor: a store to it is skipped when the stride is zero
+  // (spirvEmitterMemory.cpp, StoreWord), so its stride reaches the emitted code after all.
+  plan.info.buffers[3].packed_stride = 8;
+  plan.info.buffers[3].source        = 1;
+  plan.descriptor_sources.resize(2);
+  plan.descriptor_sources[1].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor {};
+
+  ResourceSpecialization first;
+  first.buffers.resize(4);
+  first.buffers[0].packed_stride = 16 | BufferAddTidBit;
+  first.buffers[1].packed_stride = 4;
+  first.buffers[2].packed_stride = (32u | (1u << 14u));
+  first.buffers[3].packed_stride = 8;
+  auto second                     = first;
+  second.buffers[0].packed_stride = 64 | BufferAddTidBit;
+  second.buffers[1].packed_stride = 8;
+  second.buffers[2].packed_stride = (56u | (1u << 14u));
+  second.buffers[3].packed_stride = 16;
+
+  CanonicalizeSpecialization(plan, first);
+  CanonicalizeSpecialization(plan, second);
+
+  if (!PortableShaders()) {
+    Check(first.buffers[0].packed_stride == (16 | BufferAddTidBit) &&
+              second.buffers[0].packed_stride == (64 | BufferAddTidBit),
+          "a stride was folded with portable modules off");
+    return;
+  }
+  Check(first.buffers[0].packed_stride == BufferAddTidBit &&
+            second.buffers[0].packed_stride == BufferAddTidBit,
+        "a portable stride was not folded away, or the add-tid bit was dropped with it");
+  Check(first.buffers[1].packed_stride == 0 && second.buffers[1].packed_stride == 0,
+        "a plain portable stride was not folded to nothing");
+  Check(first.buffers[2].packed_stride == (32u | (1u << 14u)) &&
+            second.buffers[2].packed_stride == (56u | (1u << 14u)),
+        "a swizzled stride was folded although the code cannot read it");
+  Check(first.buffers[3].packed_stride == 8 && second.buffers[3].packed_stride == 16,
+        "an indirect descriptor's stride was folded although the store reads it");
+}
+
+// The word the host builds and the word the emitter decodes are one format: what the host writes
+// must be a stride the module reads at run time (ShaderIR.h, RuntimeBufferStride).
+void TestBufferDescriptorWordCarriesRuntimeStride() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  DescriptorValue descriptor;
+  descriptor.dword_count = 4;
+  descriptor.dwords[1]   = 16u << 16u; // ShaderBufferResource::Stride
+  const auto word        = BufferDescriptorWord(descriptor);
+  const auto stride      = word & BufferWord::MaxStride;
+  Check(stride == 16, "a buffer word did not carry its descriptor's stride");
+  Check(RuntimeBufferStride(stride), "a word the host writes is not one the module would read");
+}
+
 } // namespace
 
 namespace Common {
@@ -608,6 +674,8 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestCanonicalizeSpecializationFoldsPortableStride();
+  TestBufferDescriptorWordCarriesRuntimeStride();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

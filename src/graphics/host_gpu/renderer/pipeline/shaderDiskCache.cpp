@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 1;
+constexpr uint32_t FormatVersion = 2;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -195,6 +195,7 @@ void Visit(Io& io, T& v) {
 	io(v.dispatch_thread_dword);
 	io(v.memory_offset_dword);
 	io(v.memory_offset_count);
+	io(v.buffer_word_count);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }
@@ -375,8 +376,8 @@ static_assert(sizeof(IR::StageInput) == 56);
 static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
-static_assert(sizeof(IR::BindingLayout) == 64);
-static_assert(sizeof(IR::CompiledShaderInfo) == 296);
+static_assert(sizeof(IR::BindingLayout) == 72);
+static_assert(sizeof(IR::CompiledShaderInfo) == 304);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);
@@ -713,6 +714,7 @@ void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info) {
 	key.Put<int32_t>(info.resources_num);
 	key.Put<int32_t>(info.fetch_attrib_reg);
 	key.Put<int32_t>(info.fetch_buffer_reg);
+	key.Put<int32_t>(info.start_instance_sgpr);
 	key.Put(info.wave_size);
 	key.Put(info.scratch_size_dwords);
 	key.Put(info.pa_cl_vs_out_cntl);

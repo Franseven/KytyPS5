@@ -87,6 +87,22 @@ SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 // KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
 bool FloatControlsDisabled(uint64_t shader_hash);
 
+// A formatted buffer's format as a portable module reads it from its buffer word (EmitRuntimeFormats):
+// the values the specialized decode bakes into the module, as SPIR-V ids. `word` is the buffer word
+// itself; `layout`, `type` and `count` its fields; the rest what DecodeRuntimeComponent needs.
+struct RuntimeFormat {
+	uint32_t word         = 0;
+	uint32_t layout       = 0;
+	uint32_t type         = 0;
+	uint32_t packed       = 0;
+	uint32_t count        = 0;
+	uint32_t log_bytes    = 0;
+	uint32_t packed_shift = 0;
+	uint32_t packed_bits  = 0;
+	uint32_t one          = 0;
+	uint32_t is_signed    = 0;
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -136,6 +152,12 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// Portable modules: each buffer's word (IR::BufferWord) and the stride it carries, loaded once
+	// at the entry so a buffer access costs no extraction.
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_strides {};
+	// Portable modules: the format each of those words carries, decoded once at the entry.
+	std::array<RuntimeFormat, IR::ShaderInfo::MaxBuffers> runtime_formats {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -444,6 +466,17 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 [[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// A buffer whose stride its code reads at run time (IR::RuntimeBufferStride) takes it from its
+// buffer word instead of the specialization: the stride field, extracted at the entry.
+uint32_t RuntimeBufferStrideValue(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// Portable modules: decode every buffer word a formatted load could need, once at the entry rather
+// than again at every component of every load.
+void EmitRuntimeFormats(EmitterState& state);
+
+// A field of a buffer word (IR::BufferWord), extracted at run time.
+uint32_t WordField(EmitterState& state, uint32_t word, uint32_t shift, uint32_t bits);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);

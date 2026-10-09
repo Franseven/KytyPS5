@@ -94,6 +94,90 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+uint32_t RuntimeBufferStrideValue(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	if (index >= state.program.bindings.buffer_word_count) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer word is missing");
+	}
+	return state.buffer_strides[index];
+}
+
+uint32_t WordField(EmitterState& state, uint32_t word, uint32_t shift, uint32_t bits) {
+	return EmitAndConstant(state, EmitShiftRightConstant(state, word, shift), (1u << bits) - 1u);
+}
+
+// A packed layout's per-component table, by layout: 11_11_10, 10_11_11, 2_10_10_10, 10_10_10_2
+// (IR::BufferWord::PackedLayouts onward).
+uint32_t PackedLayoutTable(EmitterState& state, uint32_t layout, const std::array<uint32_t, 4>& tables) {
+	auto value = ConstantU32(state, tables[3]);
+	for (uint32_t index = 3; index-- > 0;) {
+		value = Select(state, TypeU32(state),
+		               EmitCompareU32Constant(state, spv::OpIEqual, layout,
+		                                      IR::BufferWord::PackedLayouts + index),
+		               ConstantU32(state, tables[index]), value);
+	}
+	return value;
+}
+
+// Portable modules: a formatted buffer whose specialization left its format open (UsesBufferWord,
+// PortableFormats) takes format and dst_sel from its buffer word. Decoding the word once per buffer at
+// the entry keeps the per-component decode to a few operations: a component that switched on the
+// format paid tens of thousands of blocks per module.
+void EmitRuntimeFormats(EmitterState& state) {
+	const auto* descriptor =
+	    IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
+	if (descriptor == nullptr) {
+		return;
+	}
+	const auto count = std::min<uint32_t>(state.program.bindings.buffer_word_count,
+	                                      static_cast<uint32_t>(descriptor->resources.size()));
+	for (uint32_t index = 0; index < count; index++) {
+		const auto resource = descriptor->resources[index];
+		if (resource >= state.program.info.buffers.size()) {
+			continue;
+		}
+		const auto& buffer = state.program.info.buffers[resource];
+		if (!IR::RuntimeBufferFormat(buffer) ||
+		    buffer.descriptor_format != Prospero::BufferFormat::kInvalid) {
+			continue;
+		}
+		auto& format  = state.runtime_formats[index];
+		format.word   = state.buffer_words[index];
+		format.layout = WordField(state, format.word, IR::BufferWord::LayoutShift, 4);
+		format.type   = WordField(state, format.word, IR::BufferWord::TypeShift, 3);
+		format.packed =
+		    EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, format.layout,
+		                           IR::BufferWord::PackedLayouts);
+		// 11_11_10 and 10_11_11 have three components, 2_10_10_10 and 10_10_10_2 four; a byte-aligned
+		// layout carries its component count less one in its low two bits.
+		const auto packed_count = Select(
+		    state, TypeU32(state),
+		    EmitCompareU32Constant(state, spv::OpULessThan, format.layout,
+		                           IR::BufferWord::PackedLayouts + 2u),
+		    ConstantU32(state, 3), ConstantU32(state, 4));
+		format.count = Select(state, TypeU32(state), format.packed, packed_count,
+		                      EmitAddU32(state, EmitAndConstant(state, format.layout, 3),
+		                                 ConstantU32(state, 1)));
+		format.log_bytes    = EmitShiftRightConstant(state, format.layout, 2);
+		format.packed_shift = PackedLayoutTable(
+		    state, format.layout, {0x00160b00u, 0x00150a00u, 0x160c0200u, 0x1e140a00u});
+		format.packed_bits = PackedLayoutTable(
+		    state, format.layout, {0x000a0b0bu, 0x000b0b0au, 0x0a0a0a02u, 0x020a0a0au});
+		const auto integer = EmitLogicalOrBool(
+		    state,
+		    EmitCompareU32Constant(state, spv::OpIEqual, format.type,
+		                           uint32_t(Format::ComponentType::Uint)),
+		    EmitCompareU32Constant(state, spv::OpIEqual, format.type,
+		                           uint32_t(Format::ComponentType::Sint)));
+		format.one = Select(state, TypeU32(state), integer, ConstantU32(state, 1),
+		                    ConstantU32(state, 0x3f800000u));
+		format.is_signed =
+		    EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, format.type, 1), 0);
+	}
+}
+
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem) {
 	if (!mem.formatted) return mem.data_bits;
 	const auto format = mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
@@ -114,6 +198,15 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_dword_lengths[i] =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
+	// Portable modules: each buffer's word, and the stride inside it, once per buffer at the entry
+	// rather than again at every access.
+	for (uint32_t i = 0; i < state.program.bindings.buffer_word_count; i++) {
+		state.buffer_words[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferWordDword() + i);
+		state.buffer_strides[i] = EmitBinaryU32(state, spv::OpBitwiseAnd, state.buffer_words[i],
+		                                       ConstantU32(state, IR::BufferWord::MaxStride));
+	}
+	EmitRuntimeFormats(state);
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {

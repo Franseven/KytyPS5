@@ -1618,15 +1618,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			KYTY_PROFILER_BLOCK("FindBuffers::ClampRangeSize");
 			size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
 		}
-		if (size == 0) {
-			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a
+		if (size == 0 || !GuestRange {address, size}.Valid()) {
+			// Nothing is mapped at the base yet, or the clamp landed outside the guest windows
+			// BufferCache::FindBuffer accepts. Streaming titles bind regions they back later (a
 			// dispatch can precede the mapping by thousands of calls), and an unbacked region reads
-			// zero and drops writes on the hardware; binding null gives the same.
+			// zero and drops writes on the hardware; binding null gives the same. The second case
+			// used to EXIT from FindBuffer; logged so the descriptor's origin can be traced.
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1) < 8) {
 				LOGF("RenderExecutor: buffer descriptor %u outside mapped memory: stage=%s "
-				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-				     resource, ShaderStageResourceName(program.stage), address, requested_size);
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 " clamped=0x%016" PRIx64
+				     " hash=0x%016" PRIx64 " words=[0x%08x 0x%08x 0x%08x 0x%08x]\n",
+				     resource, ShaderStageResourceName(program.stage), address, requested_size, size,
+				     program.shader_hash, descriptor.fields[0], descriptor.fields[1],
+				     descriptor.fields[2], descriptor.fields[3]);
 			}
 			prepared.buffer_sources.push_back({});
 			continue;
@@ -1670,6 +1675,32 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		    prepared.buffer_sources[i].size == 0
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+		// The buffer's word (IR::BufferWord), built by the same function the compile-time side uses,
+		// so a portable module's runtime stride and format cannot disagree with its specialization.
+		if (i < layout.buffer_word_count) {
+			const auto word =
+			    ShaderRecompiler::IR::BufferDescriptorWord(snapshot.buffers[resource]);
+			prepared.shader_data[layout.BufferWordDword() + i] = word;
+			// Temporary: KYTY_LOG_BUFWORDS=<n> dumps the first n portable buffer words with the
+			// specialization they are meant to stand in for.
+			static const uint32_t bufword_limit = [] {
+				const char* value = std::getenv("KYTY_LOG_BUFWORDS");
+				return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+			}();
+			if (bufword_limit != 0) {
+				static std::atomic<uint32_t> bufword_logged = 0;
+				if (bufword_logged.fetch_add(1) < bufword_limit) {
+					const auto& slot = program.info.buffers[resource];
+					std::printf("BufWord slot=%u res=%u hash=0x%016" PRIx64
+					     " word=0x%08x stride=%u layout=%u type=%u dstsel=0x%03x"
+					     " | packed_stride=0x%08x fmt=%u swz=0x%03x formatted=%d written=%d\n",
+					     i, resource, program.shader_hash, word, word & 0xfffu, (word >> 12) & 0xfu,
+					     (word >> 16) & 0x7u, (word >> 20) & 0xfffu, slot.packed_stride,
+					     static_cast<uint32_t>(slot.descriptor_format), slot.descriptor_swizzle,
+					     static_cast<int>(slot.formatted), static_cast<int>(slot.written));
+				}
+			}
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

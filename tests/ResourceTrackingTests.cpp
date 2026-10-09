@@ -2459,8 +2459,14 @@ void TestDynamicSrtReadRemainsExplicit() {
             fixture.program.bindings.memory_offset_count == 1u &&
             fixture.program.bindings.BufferLengthDword() ==
                 fixture.program.bindings.memory_offset_dword + 1u &&
+            // A portable module reads this buffer's word as well (ShaderIR.h, BufferWord), so after
+            // the offset and length arrays come its words: one here, because the buffer is untyped
+            // and its stride therefore comes from the descriptor the draw binds.
+            fixture.program.bindings.buffer_word_count ==
+                (PortableShaders() ? 1u : 0u) &&
             fixture.program.bindings.ShaderDataDwords() ==
-                fixture.program.bindings.BufferLengthDword() + 1u,
+                fixture.program.bindings.BufferLengthDword() + 1u +
+                    fixture.program.bindings.buffer_word_count,
         "unified memory-offset layout is inconsistent");
 }
 
@@ -3122,17 +3128,28 @@ void TestBufferSwizzleSpecialization() {
                              specialization),
         "buffer resources did not materialize");
   ApplyResourceSpecialization(fixture.program, specialization);
-  Check(fixture.program.info.buffers[0].descriptor_swizzle == swizzle &&
-            specialization.buffers[0].descriptor_swizzle == swizzle,
-        "buffer destination selectors were not specialized");
+  // Which side of the key the format and the selectors land on is PortableShaders': a portable
+  // module reads both from its buffer word (RuntimeBufferFormat, PortableFormats) and leaves them
+  // open, a specialized one bakes the V#'s and keeps them. The flag is fixed for the process, so
+  // the test follows it instead of turning it on.
+  const bool portable = PortableShaders();
+  Check(portable ? (specialization.buffers[0].descriptor_swizzle ==
+                        Libs::Graphics::DstSel(4, 5, 6, 7) &&
+                    specialization.buffers[0].descriptor_format ==
+                        Libs::Graphics::Prospero::BufferFormat::kInvalid)
+                 : (specialization.buffers[0].descriptor_swizzle == swizzle &&
+                    specialization.buffers[0].descriptor_format ==
+                        Libs::Graphics::Prospero::BufferFormat::k32_32Float),
+        "a runtime buffer format was not specialized as the portable path requires");
 
   user_data[3] ^= 1u << 9u;
   ResourceSnapshot changed_snapshot;
   ResourceSpecialization changed_specialization;
   Check(MaterializeResources(resource_plan, runtime, changed_snapshot,
                              changed_specialization) &&
-            changed_specialization != specialization,
-        "buffer swizzle change did not select a new specialization key");
+            (portable ? changed_specialization == specialization
+                      : changed_specialization != specialization),
+        "a change of a runtime buffer format or swizzle selected the wrong specialization key");
 }
 
 enum class ConditionalBufferUse { Optional, Shared, Loop, Writable };

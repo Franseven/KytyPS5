@@ -176,6 +176,14 @@ const std::string& GetSkipShaderHashes() {
 	return g_config->skip_shader_hashes;
 }
 
+uint32_t ShaderWorkers() {
+	return g_config->shader_workers;
+}
+
+uint32_t ExitAfterSeconds() {
+	return g_config->exit_after_seconds;
+}
+
 bool FloatImageAtomicsEnabled() {
 	return g_config->float_image_atomics_enabled;
 }

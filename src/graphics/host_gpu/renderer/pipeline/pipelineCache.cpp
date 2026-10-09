@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
+#include "graphics/shader/ShaderOffline.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -39,6 +40,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -135,6 +137,16 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// --shader-workers <n> overrides both automatic counts; 0 keeps whichever one the caller passes,
+// so the emulator behaves exactly as before when the flag is absent.
+uint32_t ShaderWorkerCount(uint32_t automatic) {
+	const auto requested = Config::ShaderWorkers();
+	if (requested == 0) {
+		return automatic;
+	}
+	return std::min(requested, std::max(std::thread::hardware_concurrency(), 1u));
 }
 
 // The backing bytes of the guest pages one resource evaluation (MaterializeResources, a function
@@ -844,6 +856,46 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	return hash;
 }
 
+// KYTY_SEED_TRACE: one line per permutation a draw actually uses, carrying all three of the key's
+// dimensions — the shader hash, the source key (the stage input / pass state) and the resource
+// specialization. Offline precompilation needs to enumerate the latter two sets from a recording;
+// this says how big they are and whether they decompose per resource slot.
+void TraceSpecialization(uint64_t hash, uint32_t stage, std::span<const uint8_t> source_key,
+                         const ShaderRecompiler::IR::ResourceSpecialization& s) {
+	fmt::memory_buffer line;
+	fmt::format_to(std::back_inserter(line), "SEEDTRACE\t{:016x}\t{}\tsrc={:016x}", hash, stage,
+	               XXH3_64bits(source_key.data(), source_key.size()));
+	for (size_t i = 0; i < s.buffers.size(); i++) {
+		const auto& b = s.buffers[i];
+		fmt::format_to(std::back_inserter(line),
+		               "\tb{}:{}:{}:{}:{}:{}:{}:{}", i, b.packed_stride,
+		               static_cast<uint32_t>(b.descriptor_format), b.descriptor_swizzle,
+		               b.zero_stride_oob ? 1 : 0, b.indirect_root, b.indirect_mapping_offset,
+		               b.indirect_search_iterations);
+	}
+	for (size_t i = 0; i < s.images.size(); i++) {
+		const auto& im = s.images[i];
+		fmt::format_to(std::back_inserter(line), "\ti{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}", i,
+		               static_cast<uint32_t>(im.numeric_class), static_cast<uint32_t>(im.dimension),
+		               im.mip_count, static_cast<uint32_t>(im.conversion_format), im.shader_swizzle,
+		               im.cube ? 1 : 0, im.fmask ? 1 : 0, im.bindless ? 1 : 0, im.indirect_root,
+		               im.indirect_mapping_offset);
+	}
+	for (size_t i = 0; i < s.samplers.size(); i++) {
+		const auto& sm = s.samplers[i];
+		fmt::format_to(std::back_inserter(line), "\ts{}:{}:{}", i, sm.bindless ? 1 : 0,
+		               sm.bindless_mapping_offset);
+	}
+	::printf("%s\n", fmt::to_string(line).c_str());
+	::fflush(stdout);
+}
+
+// Read once, so a run that meant to trace but did not can tell "not requested" from "not reached".
+bool SeedTraceEnabled() {
+	static const bool enabled = getenv("KYTY_SEED_TRACE") != nullptr;
+	return enabled;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -928,6 +980,12 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
+		// SeedOffline: the disk cache is the only thing being built and the process exits without
+		// drawing, so there is no module to create and nothing to keep in the program cache. The
+		// SPIR-V above is validated just the same: invalid SPIR-V must never be stored.
+		if (seed_offline) {
+			return ShaderProgram {};
+		}
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
 		const auto module = CompileSPV(spirv, device);
 		EXIT_IF(module == nullptr);
@@ -1123,12 +1181,12 @@ struct PipelineCache::ProgramCache {
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
-		    .user_data                  = user_data,
-		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderGuestMemoryRaw,
-		    .userdata                   = &clean_read_cache,
-		    .read_specialization_memory = ReadShaderGuestMemory,
-		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		              .user_data                  = user_data,
+		              .shader_base                = params.Base(),
+		              .read_memory                = ReadShaderGuestMemoryRaw,
+		              .userdata                   = &clean_read_cache,
+		              .read_specialization_memory = ReadShaderGuestMemory,
+		              .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
 		static_assert(TRACKER_PAGE_SIZE == 4096u);
 		runtime.map_clean_page = +[](void* userdata, uint64_t page) {
@@ -1136,6 +1194,17 @@ struct PipelineCache::ProgramCache {
 		};
 		runtime.page_userdata = &clean_read_cache;
 		runtime.page_shift    = 12;
+		if (seed_offline) {
+			// No guest: every descriptor is unbound and reads back the pattern (Offline::ReadPatternMemory),
+			// exactly as tests/ShaderBatchTool.cpp materializes. The plan this produces is the same one
+			// the draw produces, so the source record is byte-identical; only the specialization can
+			// differ, where it is genuinely draw-derived (see CanonicalizeSpecialization).
+			runtime.read_memory                = Offline::ReadPatternMemory;
+			runtime.read_specialization_memory = Offline::ReadPatternMemory;
+			runtime.userdata                   = nullptr;
+			runtime.map_clean_page             = nullptr;
+			runtime.page_userdata              = nullptr;
+		}
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			for (uint32_t axis = 0; axis < 3u; axis++) {
@@ -1324,6 +1393,10 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			if (entry != programs.end()) {
+				if (SeedTraceEnabled()) {
+					TraceSpecialization(params.hash, static_cast<uint32_t>(stage), source_key,
+					                    entry->second.specialization);
+				}
 				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
@@ -1365,7 +1438,8 @@ struct PipelineCache::ProgramCache {
 			}
 			translated = std::move(job->second->result);
 			translating.erase(job);
-		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
+		} else if (defer_translation && !seed_offline && stage != ShaderType::Compute &&
+		           translators != nullptr) {
 			auto job = std::make_shared<TranslationJob>();
 			job->code.assign(compile_code.begin(), compile_code.end());
 			job->back_code.assign(params.back_code.begin(), params.back_code.end());
@@ -1438,8 +1512,14 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
-		auto compiled = CompileTranslated(options, std::move(translated),
-		                                  entry->second.specialization, push_data_cursor);
+		// The module is compiled with the buffer formats and strides a draws reads at run time left
+		// open (IR::PortableFormats, IR::CanonicalizeSpecialization): the SPIR-V is then the same for
+		// every draw that differs only in them, so one module serves them all and the permutation key
+		// below is theirs to share. The same specialization is what the record keeps, so a hit and a
+		// compile agree on it.
+		auto portable = entry->second.specialization;
+		ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable);
+		auto compiled = CompileTranslated(options, std::move(translated), portable, push_data_cursor);
 		std::vector<uint8_t> permutation_payload;
 		if (disk != nullptr) {
 			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,
@@ -1468,6 +1548,40 @@ struct PipelineCache::ProgramCache {
 		return handle;
 	}
 
+	// PipelineCache::SeedOffline: the draw's own path (Get), with the offline stand-in state in
+	// place of the guest's memory, for a shader no draw has been seen to use yet.
+	//
+	// A mesh draw puts its mesh draw dwords ahead of the shader data, and every stage of one keys
+	// its permutation at that cursor (GetGraphicsPrograms). A pixel shader's own stage cannot say
+	// which kind of draw it belongs to, so it is seeded at both cursors; the other stages cannot
+	// appear in the other kind of draw.
+	bool SeedOffline(Offline::Program& program) {
+		const auto stage = program.stage;
+		if (stage != ShaderType::Vertex && stage != ShaderType::Mesh && stage != ShaderType::Local &&
+		    stage != ShaderType::TessellationControl && stage != ShaderType::TessellationEvaluation &&
+		    stage != ShaderType::Pixel && stage != ShaderType::Compute) {
+			return false;
+		}
+		seed_offline = true;
+		const auto seed = [&](uint32_t push_data_cursor) {
+			switch (stage) {
+				case ShaderType::Pixel: (void)Get(program.params, program.pixel, push_data_cursor); break;
+				case ShaderType::Compute:
+					(void)Get(program.params, program.compute, push_data_cursor);
+					break;
+				default: (void)Get(program.params, program.vertex, push_data_cursor); break;
+			}
+		};
+		const bool     mesh = stage == ShaderType::Mesh || stage == ShaderType::Pixel;
+		const uint32_t mesh_cursor = ShaderRecompiler::IR::PushData::MeshDrawDwordCount;
+		seed(mesh ? mesh_cursor : 0u);
+		if (mesh) {
+			seed(0u);
+		}
+		seed_offline = false;
+		return true;
+	}
+
 	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images,
 	             ShaderDiskCache::SessionInfo session, std::filesystem::path disk_directory)
 	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images),
@@ -1480,10 +1594,15 @@ struct PipelineCache::ProgramCache {
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default 2).
-			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
-			const auto  threads = std::max<uint32_t>(
-			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+			// KYTY_TRANSLATION_THREADS=<n> (default: half the CPU, 2 to 8). Translation is the first
+			// frames of every new area, so it is worth the cores: chenxiao07's tree runs the same
+			// work on 8 and reaches the menu without the stalls this fork showed on 2.
+			const char* value = std::getenv("KYTY_TRANSLATION_THREADS");
+			const auto  default_threads =
+			    value != nullptr
+			        ? std::max<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u)
+			        : std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 8u);
+			const auto threads = ShaderWorkerCount(default_threads);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
 			                 threads);
@@ -1550,6 +1669,9 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    translations_done = 0;
 	// Set by GetGraphicsPrograms for the draw at hand: may its shaders translate in the background?
 	bool                                                        defer_translation = false;
+	// Set by SeedOffline: the offline stand-in state replaces the guest's memory in Get, no module
+	// is created, and nothing is translated on a worker.
+	bool                                                        seed_offline = false;
 	// The entries whose snapshot the parallel window refreshed for the draw at hand
 	// (PrepareStagesInParallel); Get takes them instead of walking again.
 	std::array<SourceEntry*, 2>                                 prepared {};
@@ -1699,8 +1821,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (SeedTraceEnabled()) {
+		::printf("SEEDTRACE\tenabled\n");
+		::fflush(stdout);
+	}
 	if (g_async_pipelines) {
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+		// Half the CPU, 4 to 8: the pipeline compiles that used to queue behind four workers are
+		// what the first seconds of a scene spend their time in.
+		const auto threads = ShaderWorkerCount(
+		    std::clamp(std::thread::hardware_concurrency() / 2u, 4u, 8u));
 		m_compiler         = std::make_unique<PipelineCompiler>(threads);
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
 		                 g_pipeline_wait.count());
@@ -2016,6 +2145,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	return result;
+}
+
+bool PipelineCache::SeedOffline(Offline::Program& program) {
+	return m_program_cache->SeedOffline(program);
 }
 
 bool PipelineCache::IsSkipListed(uint64_t shader_addr) {

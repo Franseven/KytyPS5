@@ -885,6 +885,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
+		trophy_system_tests
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests

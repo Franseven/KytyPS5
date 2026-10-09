@@ -6,6 +6,7 @@
 #include "controllerLightbar.h"
 #include "gameContent.h"
 #include "patchesDialog.h"
+#include "precompileDialog.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -94,6 +95,10 @@ private:
 
 	QProcess m_process;
 
+	// Set by "Run, ask about precompilation..." so a title that was told to stop asking still gets
+	// the dialog this once; cleared as soon as it has been consulted.
+	bool m_ask_anyway = false;
+
 	QPointer<ConfigurationItem> m_running_item;
 };
 
@@ -131,6 +136,10 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	connect(m_ui->widget, &ConfigurationListWidget::RunWithPrecompile, this, [this] {
+		m_ask_anyway = true;
+		Run();
+	});
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
@@ -521,6 +530,31 @@ void MainDialogPrivate::Run() {
 	m_lightbar.Stop();
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+
+	// Ask how to start, and warm the shader cache first when that is the chosen mode. The dialog
+	// returns as soon as it is done with the warm-up, so the launch below is unchanged.
+	const auto args = CreateEmulatorArgs(*info);
+	if (!args.isEmpty()) {
+		const auto settings_file = m_ui->widget->GetSettingsFile();
+		const auto prefs         = PrecompileDialog::ReadPrefs(settings_file, info->title_id);
+		const bool ask_anyway    = m_ask_anyway;
+		m_ask_anyway             = false;
+
+		const bool skip = !ask_anyway && !prefs.ask &&
+		                  prefs.mode == PrecompileDialog::Mode::Direct;
+		if (!skip) {
+			// A title that said "do not ask again" opens straight into the work it asked for; the
+			// context menu entry is the way back to the full dialog.
+			PrecompileDialog precompile(info->name, info->title_id, m_interpreter, args,
+			                            settings_file, !ask_anyway && !prefs.ask, m_main_dialog);
+			if (precompile.exec() != QDialog::Accepted) {
+				m_running_item->SetRunning(false);
+				Update();
+				return;
+			}
+		}
+	}
+
 	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();

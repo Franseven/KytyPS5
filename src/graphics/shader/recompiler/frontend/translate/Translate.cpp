@@ -1380,8 +1380,24 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			// The instance ID counts from zero, and the start instance is Vulkan's base instance: it
+			// is both the difference from the absolute instance index and the value the draw's
+			// start-instance user SGPR holds. A draw without one has no base instance to subtract,
+			// and asking for the input would add a gl_BaseInstance variable to every vertex module.
+			// ponytail: such a draw cannot carry a nonzero base instance either; add the input
+			// unconditionally only if one ever does.
+			const auto start_instance_sgpr = options.input_info.vertex->start_instance_sgpr;
+			if (start_instance_sgpr < 0) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+				                      builtin(IR::StageInputKind::InstanceIndex));
+			} else {
+				const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(8),
+				    entry_ir.ISub(builtin(IR::StageInputKind::InstanceIndex), base_instance));
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(start_instance_sgpr),
+				                      base_instance);
+			}
 		}
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&

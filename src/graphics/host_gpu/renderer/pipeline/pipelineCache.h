@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/ShaderOffline.h"
 
 #include <array>
 #include <cstddef>
@@ -155,6 +156,14 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+
+	// Offline precompilation (--precompile): translates one shader the game's own files hold,
+	// brought to the point where a draw would hand it to the compiler (ShaderOffline.h), with the
+	// offline stand-in state in place of the guest's memory, and stores its disk cache entries.
+	// Nothing is drawn and no shader module is created: the keys are the draw's, because this runs
+	// the draw's own path (ProgramCache::Get). Returns false for a shader that translates to
+	// nothing usable.
+	bool SeedOffline(Offline::Program& program);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

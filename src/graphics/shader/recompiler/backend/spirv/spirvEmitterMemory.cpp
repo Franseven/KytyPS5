@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <functional>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -83,20 +84,39 @@ uint32_t BufferLane(EmitterState& state) {
 	              ConstantU32(state, 63));
 }
 
-uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+uint32_t BufferByteAddressAt(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t index,
+                             uint32_t offset, uint32_t soffset) {
 	auto&      state  = ctx.state;
 	const auto packed = StorageBufferPackedStride(state, mem);
 	const auto stride = packed & 0x3fffu;
-	auto       index  = ctx.Arg(inst, 1);
-	if ((packed & (1u << 20u)) != 0u) {
+	if ((packed & IR::BufferAddTidBit) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
-	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	// A portable module reads the stride from the buffer word (IR::RuntimeBufferStride guarantees it
+	// is not swizzled, so the swizzled address below stays a compile-time choice). RuntimeBufferStride
+	// alone is not enough: with the mode off there is no word array to read.
+	const auto portable     = IR::PortableShaders() && IR::RuntimeBufferStride(packed);
+	const auto stride_value = swizzle || !portable ? ConstantU32(state, stride)
+	                                               : RuntimeBufferStrideValue(state, mem);
+	return CalculateBufferAddress(state, index, offset, soffset, mem.offset, stride_value,
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
+}
+
+uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	return BufferByteAddressAt(ctx, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3));
+}
+
+// The byte address of an access with `extra` bytes added to its offset operand: how the runtime format
+// decode reaches a component inside the element (RebaseRawComponent rebases the specialized decode the
+// same way, through the constant mem.offset).
+uint32_t BufferAddressPlus(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                           uint32_t extra) {
+	const auto offset =
+	    Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), ctx.Arg(inst, 2), extra);
+	return BufferByteAddressAt(ctx, mem, ctx.Arg(inst, 1), offset, ctx.Arg(inst, 3));
 }
 
 uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t add_low,
@@ -624,6 +644,220 @@ uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limit) {
 	return Select(state, TypeU32(state), wrap, limit, next);
 }
 
+// Portable modules: a formatted buffer only loaded from whose specialization left its format open
+// (IR::UsesBufferWord, PortableFormats) takes format and dst_sel from its buffer word, decoded once at
+// the entry (EmitRuntimeFormats). The decode below reproduces what the specialized one bakes into the
+// module — LoadFormattedComponent and FormattedComponentAddress — for every format.
+bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (mem.typed || !IR::PortableShaders() || mem.resource >= state.program.info.buffers.size()) {
+		return false;
+	}
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	return IR::RuntimeBufferFormat(buffer) &&
+	       buffer.descriptor_format == Prospero::BufferFormat::kInvalid;
+}
+
+const RuntimeFormat& LoadRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	if (index >= state.program.bindings.buffer_word_count) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer word is missing");
+	}
+	return state.runtime_formats[index];
+}
+
+// A value picked by a uniform runtime selector: one block per case, `fallback` for the others.
+using SwitchCases = std::vector<std::pair<uint32_t, std::function<uint32_t()>>>;
+
+template <typename Fallback>
+uint32_t EmitSwitchValue(EmitterState& state, uint32_t type, uint32_t selector,
+                         const SwitchCases& cases, Fallback&& fallback) {
+	const auto            default_label = state.builder.AllocateId();
+	const auto            merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words {spv::OpSwitch, selector, default_label};
+	for (const auto& [literal, value]: cases) {
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(literal);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {spv::OpPhi, type, state.builder.AllocateId()};
+	EmitLabel(state, default_label);
+	phi_words.push_back(fallback());
+	phi_words.push_back(state.current_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	size_t label = 0;
+	for (const auto& [literal, value]: cases) {
+		EmitLabel(state, labels[label++]);
+		phi_words.push_back(value());
+		phi_words.push_back(state.current_label);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	return phi_words[2];
+}
+
+// dst_sel of an output component: 0 zero, 1 one, 4-7 a memory component (2 and 3 reserved).
+uint32_t RuntimeSelector(EmitterState& state, const RuntimeFormat& format, uint32_t output_component) {
+	return WordField(state, format.word, IR::BufferWord::DstSelShift + 3u * output_component, 3);
+}
+
+// The memory component a selector reads (ResolveFormattedSource): formatted decoding expands the
+// element's components before the swizzle.
+uint32_t RuntimeSourceComponent(EmitterState& state, const RuntimeFormat& format, uint32_t selector) {
+	return Binary(state, spv::OpUMod, TypeU32(state), EmitAndConstant(state, selector, 3),
+	              format.count);
+}
+
+// Where a component of the element lies: the byte address of its dword, that dword's index, and the
+// component's bit offset and width inside it.
+struct RuntimeComponent {
+	uint32_t address = 0;
+	uint32_t index   = 0;
+	uint32_t shift   = 0;
+	uint32_t bits    = 0;
+};
+
+RuntimeComponent LocateRuntimeComponent(ValueEmitContext& ctx, const IR::Inst& inst,
+                                        const IR::MemoryInfo& mem, const RuntimeFormat& format,
+                                        uint32_t component) {
+	auto& state = ctx.state;
+	// Byte-aligned layouts: components of 1, 2 or 4 bytes, one after another.
+	const auto aligned_offset = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component,
+	                                   format.log_bytes);
+	const auto aligned_bits = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                                 ConstantU32(state, 8), format.log_bytes);
+	// Packed layouts: bit fields of one dword, a byte per component in the layout's table.
+	const auto by_layout = [&](uint32_t table) {
+		return EmitAndConstant(
+		    state,
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), table,
+		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component,
+		                  ConstantU32(state, 3))),
+		    0xffu);
+	};
+	const auto packed_shift = by_layout(format.packed_shift);
+	const auto packed_bits  = by_layout(format.packed_bits);
+
+	RuntimeComponent located;
+	located.address = BufferAddressPlus(ctx, inst, mem,
+	                                    Select(state, TypeU32(state), format.packed,
+	                                           ConstantU32(state, 0), aligned_offset));
+	located.index   = Binary(state, spv::OpShiftRightLogical, TypeU32(state), located.address,
+	                         ConstantU32(state, 2));
+	// A dword component is the whole dword; a smaller one sits at its byte in it.
+	const auto aligned_shift =
+	    Select(state, TypeU32(state), EmitCompareU32Constant(state, spv::OpIEqual, aligned_bits, 32),
+	           ConstantU32(state, 0),
+	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                  EmitAndConstant(state, located.address, 3), ConstantU32(state, 3)));
+	located.shift = Select(state, TypeU32(state), format.packed, packed_shift, aligned_shift);
+	located.bits  = Select(state, TypeU32(state), format.packed, packed_bits, aligned_bits);
+	return located;
+}
+
+// The component's value in its dword, converted as its format says (NormalizeFormatComponent). Every
+// conversion is computed and the format's picked: branching per component made the portable module of
+// a shader with hundreds of formatted loads tens of thousands of blocks, and only a first encounter
+// runs it — the next start reaches the specialized module.
+uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format,
+                                const RuntimeComponent& located, uint32_t dword) {
+	using Format::ComponentType;
+	// Its bits, zero- or sign-extended.
+	const auto unused  = Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32),
+	                            located.bits);
+	const auto shifted = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                            Binary(state, spv::OpShiftRightLogical, TypeU32(state), dword,
+	                                   located.shift),
+	                            unused);
+	const auto sign_extended = Unary(
+	    state, spv::OpBitcast, TypeU32(state),
+	    Binary(state, spv::OpShiftRightArithmetic, TypeI32(state),
+	           Unary(state, spv::OpBitcast, TypeI32(state), shifted), unused));
+	const auto zero_extended =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), shifted, unused);
+	const auto raw = Select(state, TypeU32(state), format.is_signed, sign_extended, zero_extended);
+	const auto max_value = [&](uint32_t all_ones) {
+		return Unary(state, spv::OpConvertUToF, TypeF32(state),
+		             Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                    ConstantU32(state, all_ones), unused));
+	};
+	const auto float_bits = [&](uint32_t value) { return EmitBitcastF32ToU32(state, value); };
+	const auto unorm      = float_bits(Binary(state, spv::OpFDiv, TypeF32(state),
+	                                          Unary(state, spv::OpConvertUToF, TypeF32(state), raw),
+	                                          max_value(0xffffffffu)));
+	const auto normalized = Binary(state, spv::OpFDiv, TypeF32(state),
+	                               Unary(state, spv::OpConvertSToF, TypeF32(state),
+	                                     EmitTBufferBitcastU32ToI32(state, raw)),
+	                               max_value(0x7fffffffu));
+	const auto clamped = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(
+	    state, normalized, ConstantF32Value(state, -1.0f));
+	const auto snorm   = float_bits(clamped);
+	const auto uscaled = float_bits(Unary(state, spv::OpConvertUToF, TypeF32(state), raw));
+	const auto sscaled = float_bits(Unary(state, spv::OpConvertSToF, TypeF32(state),
+	                                      EmitTBufferBitcastU32ToI32(state, raw)));
+	const auto pick    = [&](uint32_t condition, uint32_t value, uint32_t otherwise) {
+		return Select(state, TypeU32(state), condition, value, otherwise);
+	};
+	const auto bits_are = [&](uint32_t bits) {
+		return EmitCompareU32Constant(state, spv::OpIEqual, located.bits, bits);
+	};
+	auto floating = pick(bits_are(10u), EmitUFloatToF32Bits(state, raw, 10u), raw);
+	floating      = pick(bits_are(11u), EmitUFloatToF32Bits(state, raw, 11u), floating);
+	floating = pick(bits_are(16u), EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw)), floating);
+	const auto type_is = [&](ComponentType type) {
+		return EmitCompareU32Constant(state, spv::OpIEqual, format.type, uint32_t(type));
+	};
+	auto value = pick(type_is(ComponentType::Float), floating, raw);
+	value      = pick(type_is(ComponentType::Sscaled), sscaled, value);
+	value      = pick(type_is(ComponentType::Uscaled), uscaled, value);
+	value      = pick(type_is(ComponentType::Snorm), snorm, value);
+	return pick(type_is(ComponentType::Unorm), unorm, value);
+}
+
+// The value of an output component: its selector's constant, or its decoded memory component.
+uint32_t SelectRuntimeOutput(EmitterState& state, const RuntimeFormat& format, uint32_t selector,
+                             uint32_t decoded) {
+	const auto memory = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, selector, 4u);
+	const auto one    = EmitCompareU32Constant(state, spv::OpIEqual, selector, 1u);
+	return Select(state, TypeU32(state), memory, decoded,
+	              Select(state, TypeU32(state), one, format.one, ConstantU32(state, 0)));
+}
+
+// A formatted load whose format comes from the buffer word (UsesRuntimeFormat): each component's dword
+// bounds-checked on its own, zero when out of bounds — the plan the specialized decode shares is
+// format-sized, and this one is not.
+uint32_t RuntimeFormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
+                                      const IR::MemoryInfo& mem, uint32_t output_component,
+                                      const MemoryResourceAccess& resource) {
+	auto&       state  = ctx.state;
+	const auto& format = LoadRuntimeFormat(state, mem);
+	const auto  load   = [&](uint32_t index) {
+		return EmitValueOrZeroIfCondition(
+		    state, EmitMemoryElementInBounds(state, resource, index),
+		    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	};
+	return EmitSwitchValue(
+	    state, TypeU32(state), format.type,
+	    {{uint32_t(Format::ComponentType::Unknown),
+	      [&]() {
+		      // No format: raw dwords, dst_sel ignored.
+		      return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output_component),
+		                              resource);
+	      }}},
+	    [&]() {
+		    const auto selector = RuntimeSelector(state, format, output_component);
+		    const auto located  = LocateRuntimeComponent(
+		         ctx, inst, mem, format, RuntimeSourceComponent(state, format, selector));
+		    const auto decoded = DecodeRuntimeComponent(state, format, located, load(located.index));
+		    return SelectRuntimeOutput(state, format, selector, decoded);
+	    });
+}
+
 struct PreparedFormattedMemory {
 	Format::BufferFormatInfo info;
 	MemoryResourceAccess     resource;
@@ -701,6 +935,9 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (UsesRuntimeFormat(ctx.state, mem)) {
+			return RuntimeFormattedLoadPrepared(ctx, inst, mem, 0u, resource);
+		}
 		const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
 		if (info.type == Format::ComponentType::Unknown) {
 			return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource);

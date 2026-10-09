@@ -15006,12 +15006,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 807,
+                                   {.words = 833,
                                     .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,
                                     // The buffer length is a shader-data load, not
                                     // OpArrayLength (rendering_menu.patch).
+                                    // The words are the tighter bound: 807 before a portable module
+                                    // read its buffer's stride from the buffer word (ShaderIR.h,
+                                    // BufferWord), 833 after.
                                     .loads = 10,
                                     .stores = 4,
                                     .array_lengths = 2,
