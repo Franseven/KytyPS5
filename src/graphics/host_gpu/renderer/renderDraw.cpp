@@ -520,8 +520,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                     view.layer_count},
 		              buffer.Recorder());
 		const auto extent       = target.Extent();
-		state.width             = std::min(state.width, extent.width);
-		state.height            = std::min(state.height, extent.height);
+		// Same clamp as the depth path: the render area must fit the attachment view, not the
+		// descriptor, and the backing image at this mip level is what the view is built from.
+		const auto backing_w    = std::max(image.info.extent.width >> view.base_level, 1u);
+		const auto backing_h    = std::max(image.info.extent.height >> view.base_level, 1u);
+		state.width             = std::min(state.width, std::min(extent.width, backing_w));
+		state.height            = std::min(state.height, std::min(extent.height, backing_h));
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -589,8 +593,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Recorder());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		// The attachment is the view over the backing image; a remapped cache image can be narrower
+		// than the guest descriptor it serves, so fold the backing extent into the clamp.
+		const auto backing_w    = std::max(image.info.extent.width >> view.base_level, 1u);
+		const auto backing_h    = std::max(image.info.extent.height >> view.base_level, 1u);
+		state.width               = std::min(state.width, std::min(depth.desc.info.extent.width, backing_w));
+		state.height              = std::min(state.height, std::min(depth.desc.info.extent.height, backing_h));
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
@@ -965,7 +973,7 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 		if (FILE* file = std::fopen(trigger, "rb"); file != nullptr) {
 			std::fclose(file);
 			triggered = true;
-			LOGF("Draw census: triggered at frame %" PRIu64 "\n", frame);
+			printf("Draw census: triggered at frame %" PRIu64 "\n", frame);
 		}
 	}
 	if (!triggered || frame < setting.first_frame ||
@@ -974,7 +982,7 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 	}
 	const auto& sh_ctx = buffer.GetShaders();
 	const auto  hash   = [](uint64_t addr) { return addr != 0 ? ShaderDeclaredHash(addr) : 0ull; };
-	LOGF("Draw census: frame=%" PRIu64 " %s es=%016" PRIx64 " gs=%016" PRIx64 " ps=%016" PRIx64
+	printf("Draw census: frame=%" PRIu64 " %s es=%016" PRIx64 " gs=%016" PRIx64 " ps=%016" PRIx64
 	     " count=%u instances=%u vs_program=%d ps_program=%d ps_active=%d\n",
 	     frame, kind, hash(sh_ctx.GetVs().es_regs.data_addr),
 	     hash(sh_ctx.GetVs().gs_regs.data_addr), hash(sh_ctx.GetPs().ps_regs.data_addr), count,

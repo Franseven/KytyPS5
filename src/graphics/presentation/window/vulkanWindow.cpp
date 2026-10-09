@@ -985,14 +985,18 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanAddressBindingCallback(
 	                           : std::string("?");
 	const auto  handle   = callback_data->objectCount != 0 ? callback_data->pObjects[0].objectHandle
 	                                                       : 0ull;
-	LOGF("ADDRBIND %s type=%s handle=0x%016" PRIx64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
-	     " end=0x%016" PRIx64 "%s\n",
-	     binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind ? "bind" : "unbind",
-	     type.c_str(), handle, static_cast<uint64_t>(binding->baseAddress),
-	     static_cast<uint64_t>(binding->size),
-	     static_cast<uint64_t>(binding->baseAddress + binding->size),
-	     (binding->flags & vk::DeviceAddressBindingFlagBitsEXT::eInternalObject) ? " internal"
-	                                                                           : "");
+	// printf, not LOGF: LOGF is gated by Log::IsSilent(), which Log::Initialize() takes from
+	// --printf-direction -- and a fault hunt passes Silent, so a LOGF address report is a report
+	// nobody ever reads. The address of a device fault is only useful next to the ranges that were
+	// bound and unbound before it, and this is where those are seen.
+	std::printf("ADDRBIND %s type=%s handle=0x%016" PRIx64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
+	            " end=0x%016" PRIx64 "%s\n",
+	            binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind ? "bind" : "unbind",
+	            type.c_str(), handle, static_cast<uint64_t>(binding->baseAddress),
+	            static_cast<uint64_t>(binding->size),
+	            static_cast<uint64_t>(binding->baseAddress + binding->size),
+	            (binding->flags & vk::DeviceAddressBindingFlagBitsEXT::eInternalObject) ? " internal"
+	                                                                                   : "");
 	return VK_FALSE;
 }
 
