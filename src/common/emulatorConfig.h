@@ -74,6 +74,7 @@ struct ConfigOptions {
 	bool                   vulkan_validation_fatal     = true;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
@@ -85,6 +86,7 @@ struct ConfigOptions {
 	uint32_t               shader_workers     = 0;
 	// Quit on its own after this many seconds, the same way closing the window does. 0 = never.
 	uint32_t               exit_after_seconds = 0;
+	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -133,6 +135,7 @@ bool VulkanValidationFatal();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 bool BindlessImagesEnabled();
@@ -141,6 +144,7 @@ uint32_t ShaderWorkers();
 uint32_t ExitAfterSeconds();
 bool FloatImageAtomicsEnabled();
 bool PlayGoHackEnabled();
+bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

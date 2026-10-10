@@ -119,10 +119,12 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   bindless_images_enabled     = false;
 	QString                skip_shader_hashes;
+	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -154,10 +156,12 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		bindless_images_enabled     = other.bindless_images_enabled;
 		skip_shader_hashes          = other.skip_shader_hashes;
+		skip_notice_screen          = other.skip_notice_screen;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;

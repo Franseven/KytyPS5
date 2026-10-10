@@ -1,9 +1,10 @@
 #include "mainDialog.h"
 
+#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
-#include "controllerLightbar.h"
+#include "controllerPreview.h"
 #include "gameContent.h"
 #include "patchesDialog.h"
 #include "precompileDialog.h"
@@ -90,7 +91,7 @@ private:
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
-	ControllerLightbar m_lightbar;
+	ControllerPreview m_controller_preview;
 	QString         m_interpreter;
 
 	QProcess m_process;
@@ -117,6 +118,7 @@ MainDialogPrivate::~MainDialogPrivate() {
 void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
+	m_ui->widget->SetControllerPreview(&m_controller_preview);
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
@@ -132,7 +134,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
-			        m_lightbar.SetColor(color);
+			        m_controller_preview.SetColor(color);
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
@@ -254,7 +256,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -300,7 +304,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
-	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
+	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}
@@ -527,7 +531,7 @@ void MainDialogPrivate::Run() {
 	}
 
 	m_running_item->SetRunning(true);
-	m_lightbar.Stop();
+	m_controller_preview.SetSuspended(true);
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 
@@ -573,10 +577,11 @@ void MainDialogPrivate::Update() {
 
 	m_ui->widget->SetRunEnabled(run_enabled);
 	if (m_process.state() != QProcess::NotRunning) {
-		m_lightbar.Stop();
+		m_controller_preview.SetSuspended(true);
 		return;
 	}
-	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
+	m_controller_preview.SetSuspended(false);
+	m_controller_preview.SetColor(m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

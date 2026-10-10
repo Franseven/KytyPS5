@@ -66,9 +66,11 @@ struct File {
 	std::filesystem::path               real_name;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
+	std::atomic_bool                    readable;
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
+	std::atomic_bool                    close_on_exec;
 	SpecialFile                         special;
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
@@ -177,6 +179,7 @@ int FileDescriptors::CreateDescriptor() {
 	auto* file        = new File {};
 	file->opened      = false;
 	file->directory   = false;
+	file->readable    = false;
 	file->writable    = false;
 	file->append      = false;
 	file->sync_writes = false;
@@ -447,10 +450,12 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
-	file->name        = path;
-	file->writable    = rw_mode != Common::File::Mode::Read;
-	file->append      = append;
-	file->sync_writes = fsync || sync || dsync;
+	file->name          = path;
+	file->readable      = rw_mode != Common::File::Mode::Write;
+	file->writable      = rw_mode != Common::File::Mode::Read;
+	file->append        = append;
+	file->sync_writes   = fsync || sync || dsync;
+	file->close_on_exec = (static_cast<uint32_t>(flags) & 0x00100000u) != 0;
 
 	if (!directory && IsRandomDevice(file->name)) {
 		file->real_name = file->name;
@@ -580,6 +585,27 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	g_files->DeleteDescriptor(d);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	switch (command) {
+		case 1: return file->close_on_exec.load(std::memory_order_relaxed); // F_GETFD
+		case 2: // F_SETFD, FD_CLOEXEC
+			file->close_on_exec.store((arg & 1) != 0, std::memory_order_relaxed);
+			return OK;
+		default: return KERNEL_ERROR_EINVAL;
+	}
 }
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
@@ -777,6 +803,106 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	return bytes_read;
 }
 
+static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
+                          std::vector<KernelIovec>* buffers, size_t* total) {
+	constexpr int MaxIov = 1024;
+	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (iov == nullptr && iovcnt != 0) {
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (iovcnt != 0) {
+		buffers->assign(iov, iov + iovcnt);
+	}
+	*total = 0;
+	for (const auto& buffer: *buffers) {
+		if (buffer.iov_len > INT_MAX - *total) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		*total += buffer.iov_len;
+	}
+	return OK;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->readable) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->special == SpecialFile::Random) {
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0) {
+				Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base),
+				                         buffer.iov_len);
+				FillRandomBuffer(buffer.iov_base, buffer.iov_len);
+			}
+		}
+		return static_cast<int64_t>(total);
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position  = file->f.Tell();
+	const auto file_size = file->f.Size();
+	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
+		return KERNEL_ERROR_EIO;
+	}
+	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
+	int64_t bytes_read = 0;
+	for (const auto& buffer: buffers) {
+		if (remaining == 0) {
+			break;
+		}
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
+		uint32_t bytes = 0;
+		file->f.Read(buffer.iov_base, count, &bytes);
+		bytes_read += bytes;
+		remaining -= bytes;
+		if (bytes < count) {
+			break;
+		}
+	}
+	if (!file->f.Seek(position)) {
+		return KERNEL_ERROR_EIO;
+	}
+	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
+	return bytes_read;
+}
+
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
 
@@ -827,6 +953,72 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
 
+	return bytes_written;
+}
+
+int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->writable) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position = file->f.Tell();
+	const auto target   = (file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+	if (target > static_cast<uint64_t>(INT64_MAX) - total) {
+		return KERNEL_ERROR_EFBIG;
+	}
+	if (!file->f.Seek(target)) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	int64_t bytes_written = 0;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		uint32_t bytes = 0;
+		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		bytes_written += bytes;
+		if (bytes < buffer.iov_len) {
+			break;
+		}
+	}
+	const bool flushed  = !file->sync_writes || file->f.Flush();
+	const bool restored = file->f.Seek(position);
+	if (!flushed || !restored) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) to: %s\n", bytes_written,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
 	return bytes_written;
 }
 
@@ -969,19 +1161,11 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	auto wt = at;
 
 	if (file->special != SpecialFile::None) {
+		stat.st_mode    = 0020644u;
 		stat.st_size    = 0;
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
-		SecToTimespec(&stat.st_atim, at.ToUnix());
-		SecToTimespec(&stat.st_mtim, wt.ToUnix());
-		stat.st_ctim     = stat.st_atim;
-		stat.st_birthtim = stat.st_mtim;
-		*sb              = stat;
-
-		return OK;
-	}
-
-	if (!file->directory) {
+	} else if (!file->directory) {
 		file->mutex.Lock();
 
 		bool is_invalid = file->f.IsInvalid();

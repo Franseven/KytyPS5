@@ -156,6 +156,10 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool SyncRawImageBuffersEnabled() {
+	return g_config->sync_raw_image_buffers;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -182,6 +186,10 @@ uint32_t ShaderWorkers() {
 
 uint32_t ExitAfterSeconds() {
 	return g_config->exit_after_seconds;
+}
+
+bool SkipNoticeScreen() {
+	return g_config->skip_notice_screen;
 }
 
 bool FloatImageAtomicsEnabled() {

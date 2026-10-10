@@ -59,6 +59,8 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("k3GhuSNmBLU", Gen5::AgcCbDispatch);
 	LIB_FUNC("Abendgtz+3o", Gen5::AgcCbDispatchGetSize);
 	LIB_FUNC("w1KFAHVqpaU", Gen5::AgcCbBranch);
+	LIB_FUNC("uZW-mqsxkrM", Gen5::AgcCbBranchGetSize);
+	LIB_FUNC("7Wa3aeJgeVU", Gen5::AgcBranchPatchSetThenTarget);
 	LIB_FUNC("n2fD4A+pb+g", Gen5::AgcCbSetShRegisterRangeDirect);
 	LIB_FUNC("bxGoVxpdSPQ", Gen5::AgcCbSetShRegisterRangeDirectGetSize);
 	LIB_FUNC("UZbQjYAwwXM", Gen5::AgcCbSetShRegistersDirect);
@@ -74,6 +76,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("ozKzBP4aki4", Gen5::AgcAcbCondExecGetSize);
 	LIB_FUNC("e1DFTg+Sd8U", Gen5::AgcAcbJump);
 	LIB_FUNC("b-oySn+G2tE", Gen5::AgcAcbJumpGetSize);
+	LIB_FUNC("DwICrVxerkY", Gen5::AgcAcbRewind);
 	LIB_FUNC("htn36gPnBk4", Gen5::AgcAcbWaitRegMem);
 	LIB_FUNC("idlaArvdXEs", Gen5::AgcAcbWaitOnAddressGetSize);
 	LIB_FUNC("-RnpfpxIhec", Gen5::AgcAcbDmaData);
@@ -94,7 +97,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("1DeUNpRIDDA", Gen5::AgcDcbSetCxRegisterDirectGetSize);
 	LIB_FUNC("w4-d0n60hdo", Gen5::AgcDcbSetUcRegisterDirect);
 	LIB_FUNC("ZvwO9euwYzc", Gen5::AgcDcbSetCxRegistersIndirect);
+	LIB_FUNC("GBCh3zCihoU", Gen5::AgcDcbSetCxRegistersIndirectGetSize);
 	LIB_FUNC("-HOOCn0JY48", Gen5::AgcDcbSetShRegistersIndirect);
+	LIB_FUNC("nNlUtdDDvZ0", Gen5::AgcDcbSetShRegistersIndirectGetSize);
 	LIB_FUNC("hvUfkUIQcOE", Gen5::AgcDcbSetUcRegistersIndirect);
 	LIB_FUNC("GIIW2J37e70", Gen5::AgcDcbSetIndexSize);
 	LIB_FUNC("l4fM9K-Lyks", Gen5::AgcDcbSetIndexBuffer);
@@ -155,6 +160,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("k-JpyR2dYAM", Gen5::AgcCondExecPatchSetEnd);
 	LIB_FUNC("3ZWa3AoyWZQ", Gen5::AgcCondExecPatchSetCommandAddress);
 	LIB_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
+	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
 }
 
