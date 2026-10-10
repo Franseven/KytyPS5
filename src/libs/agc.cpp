@@ -54,6 +54,7 @@ static constexpr uint32_t AgcDmemOffset  = 0x40000;
 struct DriverDmem {
 	std::mutex mutex;
 	int64_t    physical_offset = -1;
+	bool       unavailable     = false;
 };
 
 static DriverDmem g_driver_dmem;
@@ -357,11 +358,19 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 
 	printf("version = %u\n", ver);
 	std::scoped_lock lock {Gen5Driver::g_driver_dmem.mutex};
-	if (Gen5Driver::g_driver_dmem.physical_offset >= 0) {
+	if (Gen5Driver::g_driver_dmem.physical_offset >= 0 ||
+	    Gen5Driver::g_driver_dmem.unavailable) {
 		return OK;
 	}
 	if (const auto result = Gen5Driver::InitializeDmem(); result != OK) {
-		return result;
+		// The guest calls us late: a game may already have tiled all of direct memory
+		// (Demon's Souls does). The block only holds the driver descriptor, so carry on
+		// without it instead of failing AgcInit - which the game treats as fatal.
+		LOGF_COLOR(Log::Color::Red,
+		           "\t driver dmem unavailable (0x%08" PRIx32 "), continuing without it\n",
+		           static_cast<uint32_t>(result));
+		Gen5Driver::g_driver_dmem.unavailable = true;
+		return OK;
 	}
 	struct FunctionShaderBindings {
 		uint64_t code;
