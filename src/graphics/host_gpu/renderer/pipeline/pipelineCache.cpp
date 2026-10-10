@@ -8,6 +8,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+// Telemetria dei tre pezzi di GetGraphicsPrograms (vedi FrameTelemetry).
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -21,6 +23,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/ShaderOffline.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -1225,7 +1228,8 @@ struct PipelineCache::ProgramCache {
 					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
 				}
 				t_srt_shader_hash = params.hash;
-				bool materialized = false;
+				bool       materialized = false;
+				const auto walk_t       = TelemetryNowUs();
 				if (TakePrepared(&entry->second)) {
 					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
 					static const bool verify = std::getenv("KYTY_STAGE_PREP_VERIFY") != nullptr;
@@ -1237,6 +1241,32 @@ struct PipelineCache::ProgramCache {
 					materialized = ShaderRecompiler::IR::MaterializeResources(
 					    entry->second.resource_plan, runtime, entry->second.resources,
 					    entry->second.specialization);
+				}
+				// Il walk SRT da solo: `lookup` meno questo e' la costruzione della chiave, la
+				// ricerca nell'hash map e la scelta della permutazione. Serve a sapere se i 47 us
+				// per draw del pixel stage sono il walk (e allora il fix e' il walker) o il resto.
+				if (stage == ShaderType::Pixel) {
+					TelemetryAddGpWalkPs(TelemetryNowUs() - walk_t);
+				} else {
+					TelemetryAddGpWalkVs(TelemetryNowUs() - walk_t);
+				}
+				// Le fasi del refresh, prelevate con azzeramento: il delta e' questo walk.
+				{
+					const auto  phases = ShaderRecompiler::IR::TakeSrtPhaseTimings();
+					auto&       t      = GetFrameTelemetry();
+					t.draw_gp_srt_setup_us += phases.setup_us;
+					t.draw_gp_srt_flat_us += phases.flat_us;
+					t.draw_gp_srt_buffers_us += phases.buffers_us;
+					t.draw_gp_srt_images_us += phases.images_us;
+					t.draw_gp_srt_rest_us += phases.rest_us;
+					// E il percorso che il walk ha preso: replay dei soli walk_slots o walk completo.
+					const auto walk = ShaderRecompiler::IR::TakeSrtWalkStats();
+					t.draw_gp_walk_replay += walk.replay_hit;
+					t.draw_gp_walk_key_miss += walk.replay_key_miss;
+					t.draw_gp_walk_outcome_miss += walk.replay_outcome_miss;
+					t.draw_gp_walk_full += walk.full_walk;
+					t.draw_gp_walk_empty += walk.empty_plan_walks;
+					t.draw_gp_walk_flat_slots += walk.flat_slots;
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
@@ -1273,21 +1303,37 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			// La ricerca della permutazione confronta la `ResourceSpecialization` (vettori di buffer
+			// e immagini) candidato per candidato, su *ogni* draw. Se il costo sta qui e' O(K x S)
+			// per draw e il fix e' un hash della specializzazione invece del confronto.
+			const auto perm_t  = TelemetryNowUs();
+			uint32_t   scanned = 0;
+			const auto permutation = std::ranges::find_if(
+			    entry->second.permutations, [&](const Permutation& candidate) {
+				    scanned++;
+				    const auto& layout = candidate.program.bindings;
+				    return layout.push_data_start_dword ==
+				               ShaderRecompiler::IR::PushData::StartFor(
+				                   push_data_cursor, layout.ShaderDataDwords()) &&
+				           candidate.specialization == entry->second.specialization;
+			    });
+			if (stage == ShaderType::Pixel) {
+				TelemetryAddGpPermPs(TelemetryNowUs() - perm_t);
+			} else {
+				TelemetryAddGpPermVs(TelemetryNowUs() - perm_t);
+			}
+			TelemetryAddGpPermScanned(scanned);
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
 		}
+		// Da qui in giu' non e' piu' "risolvere un programma gia' noto": e' la cache disco, la
+		// traduzione, la compilazione. Contarle dice quanto dei millisecondi pesanti e' compilazione
+		// e quanto e' preparazione per draw.
+		TelemetryCountGpCold();
 
 		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
 		if (!translating.empty()) {
@@ -1632,11 +1678,29 @@ struct PipelineCache::ProgramCache {
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
 	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+		const auto base  = params.Base();
+		const auto words = params.code;
 		std::string reason;
 		if (!function_expander.Expand(
-		        params.code, params.Base(), user_data,
-		        [](uint64_t address, std::span<uint32_t> words) {
-			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		        words, base, user_data,
+		        // A callee's address is the code base plus an S_GETPC_B64-derived offset, so it
+		        // lands inside the shader's own code. Offline the base is not a guest address: the
+		        // code is a host copy (Offline::CopyAligned) the guest reader cannot resolve, so
+		        // every call failed with "shader function code is not mapped" and the shader was
+		        // precompiled with the raw s_swappc_b64 still in it -- which the decoder does not
+		        // implement, so it gave up. Serving the in-code reads from the code itself makes the
+		        // offline expansion match the live one; anything outside the code is a real guest
+		        // read and stays with the guest reader.
+		        [base, words](uint64_t address, std::span<uint32_t> out) {
+			        const auto bytes = static_cast<uint64_t>(words.size()) * sizeof(uint32_t);
+			        const auto want  = static_cast<uint64_t>(out.size()) * sizeof(uint32_t);
+			        if (address >= base && (address - base) % sizeof(uint32_t) == 0 &&
+			            address - base + want <= bytes) {
+				        std::memcpy(out.data(), words.data() + (address - base) / sizeof(uint32_t),
+				                    want);
+				        return true;
+			        }
+			        return ReadShaderGuestMemoryRaw(nullptr, address, out);
 		        },
 		        expanded, reason, wave_size)) {
 			static std::atomic<uint32_t> reports {0};
@@ -2005,14 +2069,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
-		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
+		const auto telemetry_t = TelemetryNowUs();
+		const bool prepared = PrepareTessellationPrograms(vertex_regs, context, vertex_info,
+		                                                  vertex_params);
+		TelemetryAddGpPrepareVs(TelemetryNowUs() - telemetry_t);
+		if (!prepared) {
 			if (!ShaderFailureNonFatal()) {
 				EXIT("unsupported tessellation programs\n");
 			}
 			return {};
 		}
 	} else {
+		const auto telemetry_t = TelemetryNowUs();
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		TelemetryAddGpPrepareVs(TelemetryNowUs() - telemetry_t);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -2045,7 +2115,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		const auto telemetry_t = TelemetryNowUs();
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		TelemetryAddGpPreparePs(TelemetryNowUs() - telemetry_t);
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -2132,14 +2204,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		~PreparedScope() { cache.prepared = {}; }
 	} prepared_scope {*m_program_cache};
 	if (pixel_active && !tess_active) {
+		const auto telemetry_t = TelemetryNowUs();
 		m_program_cache->PrepareStagesInParallel(pixel_params, pixel_info, vertex_params[0],
 		                                         vertex_info[0]);
+		TelemetryAddGpParallel(TelemetryNowUs() - telemetry_t);
 	}
 	if (pixel_active) {
+		const auto telemetry_t = TelemetryNowUs();
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		TelemetryAddGpLookupPs(TelemetryNowUs() - telemetry_t);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+		const auto telemetry_t = TelemetryNowUs();
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		TelemetryAddGpLookupVs(TelemetryNowUs() - telemetry_t);
 		if (!result.vertex[i]) {
 			return {};
 		}

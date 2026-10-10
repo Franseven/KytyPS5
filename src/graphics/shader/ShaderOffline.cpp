@@ -894,7 +894,12 @@ Status PrepareOfflineProgram(const ShaderBlob& blob, Program& program, std::stri
 			input.vertex = &vertex_info;
 			break;
 		}
-		default: return Status::NotStandalone;
+		default:
+			// The precompile reports this verbatim, and a count of skips nobody can act on is not a
+			// report: name the type so a title whose whole vertex path is fetch shaders is visible.
+			failure = fmt::format("type {}: a fetch shader or a fused half, nothing to compile alone",
+			                      shader->type);
+			return Status::NotStandalone;
 	}
 	return Status::Ok;
 }

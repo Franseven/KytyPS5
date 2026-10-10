@@ -1040,6 +1040,11 @@ struct DrawStateCacheEntry {
 	DrawRenderState state {};
 };
 
+// Misurato su GT7 (mappa del mondo, 1769 draw/frame): una tabella a indice da 64 voci alza l'hit
+// rate da 55,3% a 57,7% e non muove il frame time (Total 33,58 -> 33,26 ms, dentro il rumore).
+// Cioe': i miss NON sono limite di capacita', sono stati *davvero diversi* -- la scena non
+// alterna trenta stati, ne genera centinaia di distinti. La tabella e' stata tolta: non
+// accumulare manopole spente.
 static thread_local DrawStateCacheEntry g_draw_state_cache;
 
 void InvalidateDrawStateCache() {
@@ -1091,6 +1096,64 @@ static bool DrawStateKeyPreEqual(const DrawStateKey& a, const DrawStateKey& b) {
 	return true;
 }
 
+// KYTY_DRAW_STATE_VERIFY=1: sonda di correttezza per il salto di `RefreshShaders`. Non salta
+// niente: su *ogni* `pre_key` combaciante ricalcola come sempre e confronta il risultato con quello
+// che la cache teneva dall'ultima volta, contando i disallineamenti. Gira anche sui draw che il
+// post-check rifiuterebbe, perche' la domanda e' "la `pre_key` da sola determina lo stato?", non
+// "il post-check funziona?". Zero disallineamenti su una corsa lunga vuol dire che saltare
+// `RefreshShaders` sarebbe corretto -- e allora valgono i 10,2 ms/frame che costa su GT7 (5,8 us a
+// draw, il 31% del frame, pagati anche sugli hit). Il secondo contatore dice quanti dei
+// disallineamenti sono *solo* il layout dei vertici: se i due numeri coincidono, l'unica cosa fuori
+// dalla `pre_key` e' il layout, e per salvare i programmi basta calcolare quello. Default: spenta.
+static bool DrawStateVerify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_STATE_VERIFY");
+		return value != nullptr && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Solo i campi che decidono cosa finisce davvero nella pipeline, raggruppati per *dove* il fix
+// andrebbe: bit 0 i layout dei vertici (quello che il post-check gia' guarda), bit 1 gli interp e
+// i mask del pixel shader, bit 2 le quattro pipeline risolte. Un confronto campo per campo invece
+// di un memcmp: queste struct hanno padding non inizializzato.
+static uint32_t DrawStateDiffMask(const DrawRenderState& a, const DrawRenderState& b) {
+	uint32_t mask = 0;
+	for (size_t i = 0; i < a.vertex_info.size(); i++) {
+		if (a.vertex_info[i].buffers_num != b.vertex_info[i].buffers_num ||
+		    a.vertex_info[i].fetch_buffer_reg != b.vertex_info[i].fetch_buffer_reg ||
+		    a.vertex_info[i].resources_num != b.vertex_info[i].resources_num ||
+		    a.vertex_info[i].fetch_attrib_reg != b.vertex_info[i].fetch_attrib_reg ||
+		    a.vertex_info[i].start_instance_sgpr != b.vertex_info[i].start_instance_sgpr) {
+			mask |= 1u;
+			break;
+		}
+	}
+	if (a.ps_input_info.input_num != b.ps_input_info.input_num ||
+	    a.ps_input_info.target_uint_mask != b.ps_input_info.target_uint_mask ||
+	    a.ps_input_info.target_sint_mask != b.ps_input_info.target_sint_mask ||
+	    a.ps_input_info.custom_interpolation_mask != b.ps_input_info.custom_interpolation_mask) {
+		mask |= 2u;
+	}
+	// bit 2 il programma e' cambiato, bit 3 l'handle della permutazione, bit 4 l'hash del codice.
+	// I due bit separati perche' le cause sono diverse: vedi i contatori in commandProcessor.h.
+	for (size_t i = 0; i < a.programs.vertex.size(); i++) {
+		if (a.programs.vertex[i].id != b.programs.vertex[i].id) {
+			mask |= 4u | 8u;
+		}
+		if (a.programs.vertex[i].hash != b.programs.vertex[i].hash) {
+			mask |= 4u | 16u;
+		}
+	}
+	if (a.programs.pixel.id != b.programs.pixel.id) {
+		mask |= 4u | 8u;
+	}
+	if (a.programs.pixel.hash != b.programs.pixel.hash) {
+		mask |= 4u | 16u;
+	}
+	return mask;
+}
+
 static bool CachedTargetIdsReady(const DrawRenderState& cached) {
 	for (uint32_t i = 0; i < cached.color_count; i++) {
 		if (!cached.color_info[i].image_id) {
@@ -1105,46 +1168,64 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                        DrawRenderState& state) {
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
-	// Fast L1: compare cheap pre-Refresh inputs first. A full hit replays the
-	// BindRenderTarget side effects for cached targets and skips the repeated
-	// RefreshShaders + Resolve* work. Vertex layout (buffers_num/fetch_buffer_reg)
-	// is verified post-Refresh before the cached color/depth state is reused, so
-	// 2D UI fonts never observe 3D model state.
+	const auto  telemetry_t0_us   = TelemetryNowUs();
+	// Fast L1: compare cheap pre-Refresh inputs first. Su un hit pieno si rigiocano solo gli
+	// effetti di `BindRenderTarget` per i target in cache. NON salta `RefreshShaders`: i 10,2 ms/
+	// frame che costa su ogni draw (misurati su GT7, 5,8 us a draw) si pagano anche qui, e il
+	// layout dei vertici che `post_check` confronta *viene* da li'. Saltarlo vorrebbe dire portarsi
+	// dietro programmi e vertex_info nella voce di cache, quindi prima va dimostrato che la
+	// `pre_key` copre tutto cio' che li determina. Il layout (buffers_num/fetch_buffer_reg) si
+	// verifica dopo `RefreshShaders` prima di riusare color/depth in cache, cosi' i font 2D della
+	// UI non vedono mai lo stato dei modelli 3D.
 	const DrawStateKey pre_key =
 	    BuildDrawStateKeyPre(buffer, draw, render_target_slice_offset, color_output_mask);
 	DrawStateKey post_check = pre_key;
-	bool         pre_hit =
-	    g_draw_state_cache.valid && DrawStateKeyPreEqual(pre_key, g_draw_state_cache.key);
-	if (pre_hit && !CachedTargetIdsReady(g_draw_state_cache.state)) {
-		g_draw_state_cache.valid = false;
-		pre_hit                   = false;
+	auto&        cached     = g_draw_state_cache;
+	bool         pre_hit    = cached.valid && DrawStateKeyPreEqual(pre_key, cached.key);
+	if (pre_hit && !CachedTargetIdsReady(cached.state)) {
+		cached.valid = false;
+		pre_hit      = false;
 	}
+	TelemetryAddDrawStateKey(TelemetryNowUs() - telemetry_t0_us);
+	const auto telemetry_t1_us = TelemetryNowUs();
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
+	TelemetryAddDrawStatePrograms(TelemetryNowUs() - telemetry_t1_us);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
-		g_draw_state_cache.valid = false;
+		cached.valid = false;
+		TelemetryCountDrawStateMiss();
 		return false;
+	}
+	// La sonda gira su *ogni* `pre_key` combaciante, anche quando il post-check la rifiuterebbe:
+	// la domanda a cui risponde e' "la `pre_key` da sola determina lo stato?", non "il post-check
+	// funziona?". E' `pre_key` uguale + stato fresco diverso da quello in cache = salto sbagliato.
+	if (pre_hit && DrawStateVerify()) {
+		const bool layout_diff = state.vertex_info[0].buffers_num != cached.key.vtx_buffers_num ||
+		                         state.vertex_info[0].fetch_buffer_reg != cached.key.vtx_fetch_buffer;
+		TelemetryCountDrawStateVerify(DrawStateDiffMask(state, cached.state), layout_diff);
 	}
 	post_check.vtx_buffers_num  = state.vertex_info[0].buffers_num;
 	post_check.vtx_fetch_buffer = state.vertex_info[0].fetch_buffer_reg;
-	if (pre_hit && post_check.vtx_buffers_num == g_draw_state_cache.key.vtx_buffers_num &&
-	    post_check.vtx_fetch_buffer == g_draw_state_cache.key.vtx_fetch_buffer) {
-		state.color_count = g_draw_state_cache.state.color_count;
+	if (pre_hit && post_check.vtx_buffers_num == cached.key.vtx_buffers_num &&
+	    post_check.vtx_fetch_buffer == cached.key.vtx_fetch_buffer) {
+		state.color_count = cached.state.color_count;
 		for (uint32_t i = 0; i < state.color_count; i++) {
-			state.color_info[i] = g_draw_state_cache.state.color_info[i];
+			state.color_info[i] = cached.state.color_info[i];
 			BindRenderTarget(state.color_info[i].image_id);
 		}
-		state.depth_info = g_draw_state_cache.state.depth_info;
+		state.depth_info = cached.state.depth_info;
 		if (state.depth_info.image_id) {
 			BindRenderTarget(state.depth_info.image_id);
 		}
 		// DrawRenderState has no pixel_input member in this tree; downstream
 		// selects state.ps_input_info via state.ps_active directly.
+		TelemetryCountDrawStateHit();
 		return !(state.color_count == 0 && !state.depth_info.image_id && !state.ps_active);
 	}
+	const auto telemetry_t2_us = TelemetryNowUs();
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1170,19 +1251,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	TelemetryAddDrawStateResolve(TelemetryNowUs() - telemetry_t2_us);
+	TelemetryCountDrawStateMiss();
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
-		g_draw_state_cache.valid = false;
+		cached.valid = false;
 		return false;
 	}
 
 	// Miss: publish the fresh state. post_check already carries the pre-key plus
 	// the verified vertex layout, so the next identical draw hits O(1).
-	g_draw_state_cache.key   = post_check;
-	g_draw_state_cache.state = state;
-	g_draw_state_cache.valid = true;
+	cached.key   = post_check;
+	cached.state = state;
+	cached.valid = true;
 	return true;
 }
 
@@ -1344,6 +1427,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	const auto                       telemetry_stage_prep_us = TelemetryNowUs();
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
@@ -1353,6 +1437,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
+	TelemetryAddBindStagePrep(TelemetryNowUs() - telemetry_stage_prep_us);
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	TelemetryAddDrawBindings(TelemetryNowUs() - telemetry_bind_begin_us);
@@ -1412,6 +1497,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	TelemetryAddDrawVertex(TelemetryNowUs() - telemetry_commit_vertex_begin_us);
 	const auto telemetry_commit_bind_begin_us = TelemetryNowUs();
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	TelemetryAddBindCommit(TelemetryNowUs() - telemetry_commit_bind_begin_us);
 	TelemetryAddDrawBindings(TelemetryNowUs() - telemetry_commit_bind_begin_us);
 	const auto telemetry_index_begin_us = TelemetryNowUs();
 	if (mesh_active) {

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <array>
@@ -26,6 +27,31 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+
+// Fasi del refresh (vedi SrtPhaseTimings). Per thread perche' il walk gira sul thread della GPU e,
+// con KYTY_STAGE_PREP_PARALLEL, anche su quello di preparazione degli stadi; i due non si vedono.
+thread_local SrtPhaseTimings g_srt_phases;
+
+uint64_t PhaseNowUs() {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(
+	        std::chrono::steady_clock::now().time_since_epoch())
+	        .count());
+}
+
+// Accumula una fase su *ogni* uscita dalla funzione, comprese quelle di errore: l'ultima fase ha
+// dentro diversi `return FailIndirect(...)` e senza il guardrail il tempo sparirebbe proprio nei
+// refresh che falliscono.
+struct PhaseScope {
+	explicit PhaseScope(uint64_t* target) : m_start(PhaseNowUs()), m_slot(target) {}
+	~PhaseScope() { *m_slot += PhaseNowUs() - m_start; }
+	PhaseScope(const PhaseScope&)            = delete;
+	PhaseScope& operator=(const PhaseScope&) = delete;
+
+private:
+	uint64_t  m_start;
+	uint64_t* m_slot;
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -1709,6 +1735,12 @@ void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& ru
 
 } // namespace
 
+SrtPhaseTimings TakeSrtPhaseTimings() {
+	const auto timings = g_srt_phases;
+	g_srt_phases       = {};
+	return timings;
+}
+
 int LastIndirectImageFailureLine() {
 	return g_indirect_failure_line;
 }
@@ -1739,13 +1771,17 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		// Reads through the fast page path are captured there.
 		observed.capture_ranges = &reads;
 	}
+	const auto phase_setup = PhaseNowUs();
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	SrtTraceSession trace(program, clean, walker, observed);
+	g_srt_phases.setup_us += PhaseNowUs() - phase_setup;
+	const auto phase_flat = PhaseNowUs();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return FailIndirect(__LINE__);
 	}
+	g_srt_phases.flat_us += PhaseNowUs() - phase_flat;
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
@@ -1770,6 +1806,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	const auto phase_buffers = PhaseNowUs();
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1826,6 +1863,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 			reads.resize(captured);
 		}
 	}
+	g_srt_phases.buffers_us += PhaseNowUs() - phase_buffers;
+	const auto phase_images = PhaseNowUs();
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1878,6 +1917,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 			}
 		}
 	}
+	g_srt_phases.images_us += PhaseNowUs() - phase_images;
+	const PhaseScope phase_rest(&g_srt_phases.rest_us);
 	snapshot.samplers.resize(program.info.samplers.size());
 	specialization.samplers.assign(program.info.samplers.size(), {});
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {

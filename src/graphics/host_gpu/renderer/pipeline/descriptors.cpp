@@ -1659,6 +1659,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const auto t_sources = TelemetryNowUs();
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
@@ -1702,6 +1703,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			}
 		}
 	}
+	TelemetryAddBindSources(TelemetryNowUs() - t_sources);
+	const auto t_upsrt = TelemetryNowUs();
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		if (prepared.bindless_patches.empty()) {
@@ -1728,9 +1731,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		}
 	}
+	TelemetryAddBindUpSrt(TelemetryNowUs() - t_upsrt);
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+		const auto t_updata = TelemetryNowUs();
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		TelemetryAddBindUpData(TelemetryNowUs() - t_updata);
 	}
 }
 
@@ -1786,16 +1792,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	const auto bind_find_t = TelemetryNowUs();
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
+	TelemetryAddBindFind(TelemetryNowUs() - bind_find_t);
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	const auto bind_images_t = TelemetryNowUs();
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	TelemetryAddBindImages(TelemetryNowUs() - bind_images_t);
+	const auto bind_targets_t = TelemetryNowUs();
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
@@ -1816,9 +1827,12 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	TelemetryAddBindTargets(TelemetryNowUs() - bind_targets_t);
+	const auto bind_rebind_t = TelemetryNowUs();
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
+	TelemetryAddBindRebind(TelemetryNowUs() - bind_rebind_t);
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

@@ -271,6 +271,24 @@ inline bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& 
 	return EvaluateSlow(walker, value, result);
 }
 
+// Dove finisce il walk SRT. `RefreshFlatBuffer` ha un percorso veloce (replay dell'ultima visita
+// ai blocchi: ~4,7 condizioni su ~88 blocchi visitati) e uno lento (WalkBlocks). Sapere *quale*
+// dei due gira e' la differenza fra ottimizzare il refresh dei flat slot e rifare la chiave del
+// replay: senza contatori i due casi si assomigliano in un profilo.
+struct SrtWalkStats {
+	uint64_t replay_hit          = 0; // chiave uguale e ogni condizione riconfermata: solo i walk_slots
+	uint64_t replay_key_miss     = 0; // mai camminato, o la chiave (memoria di specializzazione) e' cambiata
+	uint64_t replay_outcome_miss = 0; // chiave uguale ma una condizione e' cambiata: walk completo
+	uint64_t full_walk           = 0; // programmi senza control flow, o walk eseguito per davvero
+	uint64_t empty_plan_walks    = 0; // di quei `full_walk`, quanti sono piani *senza* control flow:
+	                                  // li' non c'e' niente da saltare, si rinfrescano tutti gli slot
+	uint64_t flat_slots          = 0; // slot rinfrescati dal percorso veloce (denominatore del costo)
+	uint64_t full_blocks         = 0; // blocchi del programma attraversato dal walk completo
+};
+
+// Azzera e ritorna i contatori accumulati su *questo* thread (il walk gira solo li').
+SrtWalkStats TakeSrtWalkStats();
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_ */

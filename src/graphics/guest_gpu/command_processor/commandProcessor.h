@@ -22,7 +22,97 @@ struct FrameTelemetry {
 	uint64_t pm4_op_us[256] = {};
 	uint64_t draw_record_us = 0;
 	uint64_t draw_state_us = 0;
+	// `draw_state_us` da solo dice quanto costa PrepareDrawRenderState, non *cosa* costa: la
+	// chiave L1, la risoluzione dei programmi o la materializzazione dei render target. Sono
+	// quattro strade diverse, quindi si contano separate.
+	uint64_t draw_state_key_us = 0;
+	uint64_t draw_state_programs_us = 0;
+	// Dentro `draw_state_programs_us`: `GetGraphicsPrograms` non e' una cosa sola, e i tre pezzi
+	// hanno fix diversi. `prepare` costruisce gli `input_info` dal draw (analisi del metadato AGC
+	// dello shader, ogni volta, hit o miss). `parallel` e' la finestra in cui due worker
+	// materializzano gli SRT mentre il draw aspetta. `lookup` e' la risoluzione vera -- se ha
+	// dentro `MaterializeResources`, il costo e' il walk degli SRT, non la cache dei programmi.
+	uint64_t draw_gp_prepare_vs_us = 0;
+	uint64_t draw_gp_prepare_ps_us = 0;
+	uint64_t draw_gp_parallel_us = 0;
+	uint64_t draw_gp_lookup_vs_us = 0;
+	uint64_t draw_gp_lookup_ps_us = 0;
+	// Dentro `lookup`: il walk SRT (`MaterializeResources`) da solo. Il resto e' la chiave, la
+	// ricerca nell'hash map, la scelta della permutazione.
+	uint64_t draw_gp_walk_vs_us = 0;
+	uint64_t draw_gp_walk_ps_us = 0;
+	// Dentro `lookup`, fuori dal walk: la ricerca della permutazione (confronto della
+	// `ResourceSpecialization` candidato per candidato) e la discesa nel percorso freddo (cache
+	// disco, traduzione, compilazione). Il resto di `lookup` meno walk e meno perm e' la chiave, la
+	// ricerca nell'hash map e la preparazione del runtime: roba da decine di nanosecondi.
+	uint64_t draw_gp_perm_vs_us = 0;
+	uint64_t draw_gp_perm_ps_us = 0;
+	uint32_t draw_gp_perm_scanned = 0;
+	uint32_t draw_gp_cold_calls = 0;
+	// Dentro il walk: le fasi del refresh SRT (SrtPhaseTimings). Si accumulano solo se il walk gira
+	// su *questo* thread: con KYTY_STAGE_PREP_PARALLEL=1 quello del vertex stage gira sull'helper e
+	// le sue fasi non tornano qui (la somma delle fasi sara' minore del walk, ed e' voluto).
+	uint64_t draw_gp_srt_setup_us = 0;
+	uint64_t draw_gp_srt_flat_us = 0;
+	uint64_t draw_gp_srt_buffers_us = 0;
+	uint64_t draw_gp_srt_images_us = 0;
+	uint64_t draw_gp_srt_rest_us = 0;
+	// Il percorso preso dal walk: replay dei soli walk_slots (veloce) contro walk completo dei
+	// blocchi. Se `replay` e' vicino al numero di walk, il costo dei flat slot e' il walker; se
+	// domina `key_miss` il problema e' la chiave del replay, non il walker.
+	uint32_t draw_gp_walk_replay = 0;
+	uint32_t draw_gp_walk_key_miss = 0;
+	uint32_t draw_gp_walk_outcome_miss = 0;
+	uint32_t draw_gp_walk_full = 0;
+	uint32_t draw_gp_walk_empty = 0;
+	uint32_t draw_gp_walk_flat_slots = 0;
+	uint64_t draw_state_resolve_us = 0;
+	uint32_t draw_state_hits = 0;
+	uint32_t draw_state_misses = 0;
+	// Sonda di correttezza per il salto di `RefreshShaders`: fra i draw la cui `pre_key` combacia
+	// con la voce in cache, quanti hanno ritrovato *lo stesso* stato ricalcolato, e quanti no.
+	// Misurato in una scena da 1376 draw/frame: 724 diff su 89.952 hit pieni = **0,805%**, quindi
+	// saltare `RefreshShaders` alla cieca e' sbagliato su un draw su 124. Serve sapere *quale* campo
+	// differisce per sapere cosa aggiungere alla chiave: tre contatori, non uno.
+	uint32_t draw_state_verify_hits = 0;
+	uint32_t draw_state_verify_diff = 0;
+	uint32_t draw_state_verify_diff_vertex = 0;
+	uint32_t draw_state_verify_diff_pixel = 0;
+	uint32_t draw_state_verify_diff_programs = 0;
+	// I due modi in cui un programma puo' cambiare, e sono cause *diverse*:
+	//   id   -- `ShaderProgram.id` e' l'handle della permutazione. Cambia quando la
+	//           `ResourceSpecialization` del draw non combacia piu' con quella della sorgente in
+	//           cache, cioe' quando cambia la *memoria guest* che lo shader legge. Non c'e' modo
+	//           di prevederlo da un registro: se sono tutti id, saltare `RefreshShaders` non e'
+	//           solo sbagliato, e' non recuperabile con una chiave.
+	//   hash -- `options.shader_hash` per il VS non e' solo l'hash di `es_regs.data_addr`: sul
+	//           percorso GS-front e' XXH3 di {front, back}, dove back sta in `gs_regs.data_addr`.
+	//           Quel campo NON e' nella `pre_key`. Se i diff sono hash, la chiave si completa
+	//           aggiungendo gli indirizzi degli stadi che la composizione legge.
+	uint32_t draw_state_verify_diff_programs_id = 0;
+	uint32_t draw_state_verify_diff_programs_hash = 0;
+	// Di quei disallineamenti, quanti sono solo il layout dei vertici -- cioe' esattamente cio' che
+	// il post-check gia' intercetta. Se `diff == layout_diff` la sola cosa che la `pre_key` non
+	// copre e' il layout, e allora basta calcolare quello per salvare i programmi.
+	uint32_t draw_state_verify_layout_diff = 0;
 	uint64_t draw_bindings_us = 0;
+	// Dentro `draw_bindings_us`, che e' il 23% del frame su GT7 e non era mai stato aperto:
+	// la preparazione dei descrittori (risoluzione delle immagini dei descrittori, dei target di
+	// render, dei buffer) e il commit nella command buffer Vulkan sono due costi con fix opposti --
+	// il primo si memoizza, il secondo si registra piu' tardi o si fonde.
+	uint64_t draw_bind_stage_prep_us = 0; // PrepareBindings, una volta per stadio
+	uint64_t draw_bind_find_us = 0;       // FindBuffers: risoluzione degli indirizzi guest
+	uint64_t draw_bind_images_us = 0;     // RebindImages: le immagini dei descrittori
+	uint64_t draw_bind_targets_us = 0;    // i color target: FindImage + BindRenderTarget
+	uint64_t draw_bind_rebind_us = 0;     // RebindBuffers, l'ultimo giro
+	// Dentro `draw_bind_rebind_us`: il giro costruisce i buffer e poi *carica* in un ring host
+	// visibile la tabella SRT appiattita e i dati di shader, una volta per stadio per draw. Sapere
+	// quanto di quel millisecondo e' la copia e' la differenza fra un memo sul contenuto (che
+	// richiede un confronto) e niente affatto.
+	uint64_t draw_bind_sources_us = 0;  // NativeStorageBuffer + word del descrittore, per buffer
+	uint64_t draw_bind_upsrt_us = 0;    // NativeUpload + FillFlatSlotsOnGpu della SRT appiattita
+	uint64_t draw_bind_updata_us = 0;   // NativeUpload dei dati di shader
+	uint64_t draw_bind_commit_us = 0;     // CommitBindings: le chiamate vkCmd*
 	uint64_t draw_vertex_us = 0;
 	uint64_t draw_pipe_us = 0;
 	uint64_t draw_emit_us = 0;
@@ -61,6 +151,96 @@ inline void TelemetryAddDrawState(uint64_t delta_us) {
 	GetFrameTelemetry().draw_state_us += delta_us;
 }
 
+inline void TelemetryAddDrawStateKey(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_key_us += delta_us;
+}
+
+inline void TelemetryAddDrawStatePrograms(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_programs_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateResolve(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_resolve_us += delta_us;
+}
+
+inline void TelemetryAddGpPrepareVs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_prepare_vs_us += delta_us;
+}
+
+inline void TelemetryAddGpPreparePs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_prepare_ps_us += delta_us;
+}
+
+inline void TelemetryAddGpParallel(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_parallel_us += delta_us;
+}
+
+inline void TelemetryAddGpLookupVs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_lookup_vs_us += delta_us;
+}
+
+inline void TelemetryAddGpLookupPs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_lookup_ps_us += delta_us;
+}
+
+inline void TelemetryAddGpWalkVs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_walk_vs_us += delta_us;
+}
+
+inline void TelemetryAddGpWalkPs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_walk_ps_us += delta_us;
+}
+
+inline void TelemetryAddGpPermVs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_perm_vs_us += delta_us;
+}
+
+inline void TelemetryAddGpPermPs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_gp_perm_ps_us += delta_us;
+}
+
+inline void TelemetryAddGpPermScanned(uint32_t candidates) {
+	GetFrameTelemetry().draw_gp_perm_scanned += candidates;
+}
+
+inline void TelemetryCountGpCold() {
+	GetFrameTelemetry().draw_gp_cold_calls++;
+}
+
+inline void TelemetryCountDrawStateHit() {
+	GetFrameTelemetry().draw_state_hits++;
+}
+
+inline void TelemetryCountDrawStateMiss() {
+	GetFrameTelemetry().draw_state_misses++;
+}
+
+inline void TelemetryCountDrawStateVerify(uint32_t diff_mask, bool layout_diff) {
+	auto& telemetry = GetFrameTelemetry();
+	telemetry.draw_state_verify_hits++;
+	if (diff_mask != 0) {
+		telemetry.draw_state_verify_diff++;
+	}
+	if ((diff_mask & 1u) != 0) {
+		telemetry.draw_state_verify_diff_vertex++;
+	}
+	if ((diff_mask & 2u) != 0) {
+		telemetry.draw_state_verify_diff_pixel++;
+	}
+	if ((diff_mask & 4u) != 0) {
+		telemetry.draw_state_verify_diff_programs++;
+	}
+	if ((diff_mask & 8u) != 0) {
+		telemetry.draw_state_verify_diff_programs_id++;
+	}
+	if ((diff_mask & 16u) != 0) {
+		telemetry.draw_state_verify_diff_programs_hash++;
+	}
+	if (layout_diff) {
+		telemetry.draw_state_verify_layout_diff++;
+	}
+}
+
 inline void TelemetryAddDrawBindings(uint64_t delta_us) {
 	GetFrameTelemetry().draw_bindings_us += delta_us;
 }
@@ -71,6 +251,42 @@ inline void TelemetryAddDrawVertex(uint64_t delta_us) {
 
 inline void TelemetryAddDrawPipe(uint64_t delta_us) {
 	GetFrameTelemetry().draw_pipe_us += delta_us;
+}
+
+inline void TelemetryAddBindStagePrep(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_stage_prep_us += delta_us;
+}
+
+inline void TelemetryAddBindFind(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_find_us += delta_us;
+}
+
+inline void TelemetryAddBindImages(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_images_us += delta_us;
+}
+
+inline void TelemetryAddBindTargets(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_targets_us += delta_us;
+}
+
+inline void TelemetryAddBindRebind(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_rebind_us += delta_us;
+}
+
+inline void TelemetryAddBindSources(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_sources_us += delta_us;
+}
+
+inline void TelemetryAddBindUpSrt(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_upsrt_us += delta_us;
+}
+
+inline void TelemetryAddBindUpData(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_updata_us += delta_us;
+}
+
+inline void TelemetryAddBindCommit(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_commit_us += delta_us;
 }
 
 inline void TelemetryAddDrawEmit(uint64_t delta_us) {

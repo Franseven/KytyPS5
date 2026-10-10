@@ -774,6 +774,14 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	return true;
 }
 
+thread_local SrtWalkStats g_walk_stats;
+
+SrtWalkStats TakeSrtWalkStats() {
+	const auto stats = g_walk_stats;
+	g_walk_stats      = {};
+	return stats;
+}
+
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
 	if (program.evaluation_depth == program.evaluation_contexts.size()) {
 		program.evaluation_contexts.emplace_back();
@@ -1244,6 +1252,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
+		++g_walk_stats.full_walk;
+		++g_walk_stats.empty_plan_walks;
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 			if (!refresh(slot)) return false;
 		}
@@ -1281,6 +1291,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			}
 		}
 		if (same) {
+			++g_walk_stats.replay_hit;
+			g_walk_stats.flat_slots += m_program.walk_slots.size();
 			flat.assign(m_program.srt_reads.size(), 0u);
 			for (const auto slot: m_program.walk_slots) {
 				if (!refresh(slot)) return false;
@@ -1304,7 +1316,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			}
 			return true;
 		}
+		++g_walk_stats.replay_outcome_miss;
+	} else {
+		++g_walk_stats.replay_key_miss;
 	}
+	++g_walk_stats.full_walk;
+	g_walk_stats.full_blocks += m_program.control_flow.size();
 	return WalkBlocks(flat, refresh, outcome, key);
 }
 

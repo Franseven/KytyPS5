@@ -8,7 +8,9 @@
 // the header's GE_CNTL group size (points, lines or triangles), identity pixel interpolators, the
 // default export mapping, and stand-in vertex attribute and buffer tables built from the
 // header's own input semantics. The host subgroup size is 32, as on
-// NVIDIA. Shader function calls are not expanded: their callees live in game memory.
+// NVIDIA. Shader function calls are expanded first, as PipelineCache::ExpandShaderFunctions does
+// before translating in game: a callee's address is the code base plus an S_GETPC_B64-derived
+// offset, so it lands inside the shader's own code and the reads are served from the buffer.
 //
 // usage: shader_batch_tool <shader folder> <log file> [first manifest row] [end row]
 //        shader_batch_tool --enumerate <game folder> <log file> [first] [end]
@@ -32,6 +34,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -56,6 +59,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <xxhash.h>
 
@@ -101,11 +105,17 @@ std::vector<ManifestRow> ReadManifest(const std::filesystem::path& folder) {
 	std::ifstream            file(folder / "manifest.csv");
 	std::vector<ManifestRow> rows;
 	std::string              line;
-	std::getline(file, line);
+	// The dump ShaderDumpConsider writes has no header row, the one a hand-made folder carries does:
+	// tell them apart by the first field being a hash, or the header line would drop a shader.
+	const auto is_hash = [](std::string_view field) {
+		return field.size() == 16 &&
+		       field.find_first_not_of("0123456789abcdefABCDEF") == std::string_view::npos;
+	};
 	while (std::getline(file, line)) {
 		const auto first  = line.find(',');
 		const auto second = line.find(',', first + 1);
-		if (line.empty() || first == std::string::npos || second == std::string::npos) {
+		if (line.empty() || first == std::string::npos || second == std::string::npos ||
+		    !is_hash(std::string_view(line).substr(0, first))) {
 			continue;
 		}
 		rows.push_back({.hash = std::strtoull(line.substr(0, first).c_str(), nullptr, 16),
@@ -262,9 +272,48 @@ void RunShader(const std::vector<char>& header_bytes, const std::vector<char>& c
 	options.non_fatal       = true;
 	options.bindless_images = true;
 
-	const auto unsupported     = UnsupportedInstructions(params.code);
+	// Function calls first, as PipelineCache::ExpandShaderFunctions does before translating (or the
+	// raw s_swappc_b64 reaches the decoder, which does not implement it, and a shader the emulator
+	// compiles in game is reported here as unsupported). A callee's address is the code base plus an
+	// S_GETPC_B64-derived offset, so it lands inside `code` -- which here is a host copy, not a guest
+	// address, so those reads are served from the buffer itself; anything else is stand-in memory.
+	std::vector<uint32_t> expanded;
+	{
+		const auto  base  = params.Base();
+		const auto  words = params.code;
+		std::string reason;
+		ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+		if (!expander.Expand(words, base, options.user_data,
+		                     [base, words](uint64_t address, std::span<uint32_t> out) {
+			                     const auto bytes =
+			                         static_cast<uint64_t>(words.size()) * sizeof(uint32_t);
+			                     const auto want =
+			                         static_cast<uint64_t>(out.size()) * sizeof(uint32_t);
+			                     if (address >= base &&
+			                         (address - base) % sizeof(uint32_t) == 0 &&
+			                         address - base + want <= bytes) {
+				                     std::memcpy(
+				                         out.data(),
+				                         words.data() + (address - base) / sizeof(uint32_t), want);
+				                     return true;
+			                     }
+			                     return Offline::ReadPatternMemory(nullptr, address, out);
+		                     },
+		                     expanded, reason, options.wave_size)) {
+			Offline::AppendNote(note, "expansion: " + reason);
+		} else if (!expanded.empty()) {
+			// Silence here used to mean two different things: "no calls at all" and "the calls were
+			// expanded". Name the second, or a report cannot tell which shaders the pass rescued.
+			Offline::AppendNote(note, fmt::format("calls expanded to {} words", expanded.size()));
+		}
+	}
+	const std::span<const uint32_t> translate_code =
+	    expanded.empty() ? params.code : std::span<const uint32_t>(expanded);
+	// The list the report shows has to be the code that was translated: with the calls expanded the
+	// raw s_swappc_b64 is gone, and naming it would call unsupported a shader that compiled.
+	const auto unsupported     = UnsupportedInstructions(translate_code);
 	const auto translate_begin = std::chrono::steady_clock::now();
-	auto       translated      = ShaderRecompiler::TranslateProgram(params.code, options);
+	auto       translated      = ShaderRecompiler::TranslateProgram(translate_code, options);
 	const auto translate_ms    = MillisecondsSince(translate_begin);
 	// Upstream executes BVH dispatches now (337f4320): no "ray tracing" outcome any more.
 	const char* outcome        = translated.unsupported ? "gave up" : "ok";

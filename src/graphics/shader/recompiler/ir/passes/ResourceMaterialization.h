@@ -60,6 +60,23 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // MaterializeResources call on this thread, or 0.
 int LastIndirectImageFailureLine();
 
+// Where a refresh spends its microseconds. Il walk SRT e' il 28% del frame su GT7 e la domanda e'
+// *cosa* dentro di lui: costruire i due walker e la sessione di replay (una volta per draw), il
+// refresh dei flat slot, o i tre giri di descrittori. Sono tre fix diversi -- il primo si toglie
+// riusando i walker, il secondo e' il walker, il terzo e' il numero di descrittori valutati.
+// Accumulati per thread e **prelevati con azzeramento** (vedi TakeSrtPhaseTimings): chi chiama
+// MaterializeResources una volta per draw legge il delta di quel draw.
+struct SrtPhaseTimings {
+	uint64_t setup_us   = 0; // costruzione dei due walker + sessione di replay, per chiamata
+	uint64_t flat_us    = 0; // RefreshFlatBuffer: i flat slot
+	uint64_t buffers_us = 0; // il giro dei buffer, write extent compresi
+	uint64_t images_us  = 0; // il giro delle immagini
+	uint64_t rest_us    = 0; // sampler, user data, canonicalizzazione
+};
+
+// Il delta accumulato su questo thread dall'ultima chiamata, e azzera.
+SrtPhaseTimings TakeSrtPhaseTimings();
+
 // The buffer word (BufferWord) of a materialized V#: what a portable module reads instead of the
 // stride and format the specialization baked. 0 when the descriptor is not a buffer one.
 uint32_t BufferDescriptorWord(const DescriptorValue& descriptor);

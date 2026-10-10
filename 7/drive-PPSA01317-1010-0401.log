@@ -1,0 +1,32 @@
+**********************
+Avvio della trascrizione di PowerShell
+Ora di inizio: 20261010040147
+Nome utente: PC-DI-FRANSEVEN\spett
+Utente RunAs: PC-DI-FRANSEVEN\spett
+Nome configurazione: 
+Computer: PC-DI-FRANSEVEN (Microsoft Windows NT 10.0.26300.0)
+Applicazione host: C:\Program Files\PowerShell\7\pwsh.dll -NoProfile -ExecutionPolicy Bypass -File X:\KYTY-PS5\KYTY-WORK\tools\drive-warm.ps1 -Game X:\PS5\PPSA01317-app Gran Turismo 7 -Title PPSA01317 -WorkDir X:\KYTY-PS5\KYTY-WORK\pre\GT7 -Seconds 120 -Plan J:120@4000,J:120@500,J:120@500,DOWN:120@6000,ENTER:120@8000
+ID processo: 37580
+PSVersion: 7.6.6
+PSEdition: Core
+GitCommitId: 7.6.6
+OS: Microsoft Windows 10.0.26300
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+PS>TerminatingError(): "voce di -Plan non valida: 'J:120@4000,J:120@500,J:120@500,DOWN:120@6000,ENTER:120@8000' (atteso TASTO:holdMs@gapMs)"
+voce di -Plan non valida: 'J:120@4000,J:120@500,J:120@500,DOWN:120@6000,ENTER:120@8000' (atteso TASTO:holdMs@gapMs)
+Exception: X:\KYTY-PS5\KYTY-WORK\tools\drive-warm.ps1:93
+Line |
+  93 |  … .Success) { throw "voce di -Plan non valida: '$s' (atteso TASTO:holdM …
+     |                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | voce di -Plan non valida: 'J:120@4000,J:120@500,J:120@500,DOWN:120@6000,ENTER:120@8000' (atteso
+     | TASTO:holdMs@gapMs)
+
+**********************
+Fine della trascrizione di PowerShell
+Ora di fine: 20261010040147
+**********************

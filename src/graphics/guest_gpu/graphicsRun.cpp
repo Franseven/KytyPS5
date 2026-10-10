@@ -1885,6 +1885,69 @@ void TelemetryEndFrame() {
 		     static_cast<double>(telemetry.wait_flip_us) * frame_avg,
 		     static_cast<double>(telemetry.wait_gc_us) * frame_avg, telemetry.flushes,
 		     telemetry.draws);
+		// `State` da solo non dice dove va il tempo: la chiave L1, la risoluzione dei programmi o
+		// la materializzazione dei target sono tre strade con tre fix diversi, quindi si stampa
+		// anche la scomposizione -- riga separata per non rompere chi legge la prima.
+		LOGF("[DRAW_STATE] State: %.2f ms = key: %.2f ms + programs: %.2f ms + resolve: %.2f ms | L1: %u hit / %u miss (%.1f%%) | verify: %u diff [V%u P%u G%u id%u hash%u] (%u di layout) / %u pre-hit\n",
+		     static_cast<double>(telemetry.draw_state_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_key_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_programs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_resolve_us) * frame_avg,
+		     telemetry.draw_state_hits, telemetry.draw_state_misses,
+		     (telemetry.draw_state_hits + telemetry.draw_state_misses) == 0
+		         ? 0.0
+		         : 100.0 * static_cast<double>(telemetry.draw_state_hits) /
+		               static_cast<double>(telemetry.draw_state_hits + telemetry.draw_state_misses),
+		     telemetry.draw_state_verify_diff, telemetry.draw_state_verify_diff_vertex,
+		     telemetry.draw_state_verify_diff_pixel, telemetry.draw_state_verify_diff_programs,
+		     telemetry.draw_state_verify_diff_programs_id,
+		     telemetry.draw_state_verify_diff_programs_hash, telemetry.draw_state_verify_layout_diff,
+		     telemetry.draw_state_verify_hits);
+		LOGF("[DRAW_STATE_GP] programs = prepare: %.2f ms (vs %.2f + ps %.2f) + parallel: %.2f ms "
+		     "+ lookup: %.2f ms (vs %.2f + ps %.2f) | walk: %.2f ms (vs %.2f + ps %.2f)"
+		     " | perm: %.2f ms (vs %.2f + ps %.2f) | cold: %u chiamate, %u permutazioni confrontate\n"
+		     "[DRAW_STATE_SRT] walk = setup: %.2f ms + flat: %.2f ms + buffers: %.2f ms + images: %.2f ms "
+		     "+ rest: %.2f ms\n"
+		     "[DRAW_STATE_WALK] replay: %u hit + %u key-miss + %u outcome-miss = %u walk completi "
+		     "(%u senza control flow); %u flat slot rinfrescati\n"
+		     "[DRAW_STATE_BIND] Bind = stage prep: %.2f ms + find: %.2f ms + images: %.2f ms + "
+		     "targets: %.2f ms + rebind: %.2f ms + commit: %.2f ms\n"
+		     "[DRAW_STATE_REBIND] rebind = sources: %.2f ms + up srt: %.2f ms + up data: %.2f ms\n\n",
+		     static_cast<double>(telemetry.draw_gp_prepare_vs_us + telemetry.draw_gp_prepare_ps_us) *
+		         frame_avg,
+		     static_cast<double>(telemetry.draw_gp_prepare_vs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_prepare_ps_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_parallel_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_lookup_vs_us + telemetry.draw_gp_lookup_ps_us) *
+		         frame_avg,
+		     static_cast<double>(telemetry.draw_gp_lookup_vs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_lookup_ps_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_walk_vs_us + telemetry.draw_gp_walk_ps_us) *
+		         frame_avg,
+		     static_cast<double>(telemetry.draw_gp_walk_vs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_walk_ps_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_perm_vs_us + telemetry.draw_gp_perm_ps_us) *
+		         frame_avg,
+		     static_cast<double>(telemetry.draw_gp_perm_vs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_perm_ps_us) * frame_avg,
+		     telemetry.draw_gp_cold_calls, telemetry.draw_gp_perm_scanned,
+		     static_cast<double>(telemetry.draw_gp_srt_setup_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_srt_flat_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_srt_buffers_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_srt_images_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_gp_srt_rest_us) * frame_avg,
+		     telemetry.draw_gp_walk_replay, telemetry.draw_gp_walk_key_miss,
+		     telemetry.draw_gp_walk_outcome_miss, telemetry.draw_gp_walk_full,
+		     telemetry.draw_gp_walk_empty, telemetry.draw_gp_walk_flat_slots,
+		     static_cast<double>(telemetry.draw_bind_stage_prep_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_find_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_images_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_targets_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_rebind_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_commit_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_sources_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_upsrt_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bind_updata_us) * frame_avg);
 		telemetry = FrameTelemetry {};
 	}
 	// Draw-state L1 scope: never leak into a foreign frame.
