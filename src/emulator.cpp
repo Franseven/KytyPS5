@@ -180,7 +180,7 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 // The shaders a game draws are a subset of the ones its files hold, and a draw whose own state
 // differs from the offline stand-ins (ShaderOffline.h) compiles as it does today, so this is a
 // head start and never a correctness question. The line per shader is machine readable: the
-// launcher counts the SHADERS line for its denominator and the PROGRESS lines for the bar.
+// launcher counts the DISTINCT line for its denominator and the PROGRESS lines for the bar.
 static void PrecompileShaders(const std::filesystem::path& game) {
 	auto* cache = Libs::Graphics::WindowPipelineCache();
 	EXIT_IF(cache == nullptr);
