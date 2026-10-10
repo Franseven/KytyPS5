@@ -152,7 +152,7 @@ static void PrintUsage() {
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone / --no-redzone             Protect the guest SysV red zone. Default: on.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -316,8 +316,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (arg == "--redzone") {
-			options.config.red_zone_protection_enabled = true;
+		if (arg == "--redzone" || arg == "--no-redzone") {
+			options.config.red_zone_protection_enabled = arg == "--redzone";
 			continue;
 		}
 #endif
@@ -570,6 +570,13 @@ static int Main(int argc, char* argv[]) {
 
 	RunOptions options;
 	bool       show_help = false;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows exception dispatch does not preserve the guest's SysV red zone, so guest code that keeps
+	// live values below rsp reads back whatever the handler left there. Two titles of the test bank
+	// fault on it, one fatally. The price is a load-time analysis pass; `--no-redzone` turns it off.
+	options.config.red_zone_protection_enabled = true;
+#endif
 
 	if (argc < 2) {
 		PrintUsage();
