@@ -972,14 +972,26 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
+	# The CFG structurizer recurses once per nesting level (`CFG::Visit`, ShaderCFG.cpp) and a
+	# big shader nests deeply: Wolverine's compute shader 0xe6d76d24f59f8015 (2424 blocks, 39
+	# loops) ran off the 1 MB default stack and died as an access violation inside
+	# `CFG Structurize` -- not as STATUS_STACK_OVERFLOW, because the recursion's frames skip the
+	# guard page. 32 MB of *reserve* costs only address space (commit stays one page).
+	# ponytail: a ceiling, not a fix -- the recursion is still unbounded, so a shader nested
+	# past ~32 MB of frames would crash the same way. Make `Visit` iterative when one does.
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
+		"/STACK:33554432,65536"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
 	)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
+	if(WIN32)
+		# Same overflow, MinGW/LLD spelling.
+		target_link_options(kyty_emulator PRIVATE "-Wl,--stack,33554432")
+	endif()
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 	# LINK_FLAGS is a space-delimited string: a -Map path containing spaces would
 	# be split into bogus arguments, so pass it as a discrete link option instead.
