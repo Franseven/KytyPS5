@@ -1158,8 +1158,23 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+// VGT_DRAW_INITIATOR's source select is its low two bits; the AGC entry points write 2, or 2 | 0x20
+// (bit 5, the major mode). Astro Bot writes its own packets and puts 0 there. The value never reaches
+// the draw - `indexed` comes from the packet's opcode and the arguments from the indirect base - so an
+// unknown one is reported instead of fatal.
+static void LogDrawInitiator(uint32_t draw_initiator) {
+	if ((draw_initiator & ~0x20u) == 2u || (draw_initiator & 0x3u) == 2u) {
+		return;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\t indirect draw draw_initiator = 0x%08" PRIx32 " (not 2 or 0x22)\n",
+		     draw_initiator);
+	}
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	LogDrawInitiator(draw_initiator);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	const auto* args_addr =
@@ -1239,7 +1254,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed, uint32_t draw_index_register) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	LogDrawInitiator(draw_initiator);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	uint32_t draw_count = max_count_or_count;
