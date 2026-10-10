@@ -30,9 +30,15 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <string>
+#include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -668,6 +674,51 @@ static void patch_shader_register_address(ShaderRegister* regs, uint32_t num_reg
 	hi->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
 }
 
+// KYTY_SHADER_DUMP=<folder>: every distinct shader the game hands to AGC, written as <hash>.header
+// and <hash>.code with a manifest.csv — the folder ShaderBatchTool reads and the offline
+// precompiler takes as a corpus (KYTY_SHADER_CORPUS). A title's eboot.bin carries only part of its
+// shaders, and the ones its own data files hold are in no container the offline half can read: this
+// is the one place they are ever seen whole. Unset, it costs one getenv per created shader.
+static void ShaderDumpConsider(const void* header, const void* code, uint32_t header_size,
+                               uint32_t code_size) {
+	static const std::filesystem::path folder = [] {
+		const char* value = std::getenv("KYTY_SHADER_DUMP");
+		if (value == nullptr || value[0] == '\0') {
+			return std::filesystem::path {};
+		}
+		std::error_code error;
+		std::filesystem::create_directories(value, error);
+		return std::filesystem::path(value);
+	}();
+	if (folder.empty() || header == nullptr || code == nullptr || header_size == 0 ||
+	    code_size == 0) {
+		return;
+	}
+	const auto hash = XXH3_64bits(code, code_size);
+	{
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> seen;
+		std::lock_guard                     lock(mutex);
+		if (!seen.insert(hash).second) {
+			return;
+		}
+	}
+	static constexpr std::array<const char*, 9> TypeNames = {"Cs", "Ps", "Gs", "Hs", "Gf",
+	                                                         "Hf", "Gb", "Hb", "Fs"};
+	const auto kind = static_cast<uint8_t>(static_cast<const uint8_t*>(header)[90]);
+	const auto name = fmt::format("{:016x}", hash);
+	std::ofstream(folder / (name + ".header"), std::ios::binary)
+	    .write(static_cast<const char*>(header), header_size);
+	std::ofstream(folder / (name + ".code"), std::ios::binary)
+	    .write(static_cast<const char*>(code), code_size);
+	{
+		static std::mutex mutex;
+		std::lock_guard   lock(mutex);
+		std::ofstream(folder / "manifest.csv", std::ios::app)
+		    << name << ',' << (kind < TypeNames.size() ? TypeNames[kind] : "??") << ",runtime\n";
+	}
+}
+
 int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {
 	PRINT_NAME();
 
@@ -680,6 +731,10 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	     reinterpret_cast<uint64_t>(header), reinterpret_cast<uint64_t>(code));
 
 	auto* h = static_cast<Shader*>(header);
+
+	// Before update_addr turns the header's self-relative pointers into absolute ones: what the game
+	// holds on disk is the form a corpus has to keep, since the offline path relocates it again.
+	ShaderDumpConsider(header, const_cast<const void*>(code), h->header_size, h->shader_size);
 
 	auto update_addr = [](auto& m) {
 		if (m != nullptr) {

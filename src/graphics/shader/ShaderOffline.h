@@ -38,6 +38,11 @@ struct ShaderBlob {
 // per source that was read.
 std::vector<ShaderBlob> EnumerateGame(const std::filesystem::path& game, std::string& report);
 
+// A folder of <hash>.header + <hash>.code pairs: what the emulator's KYTY_SHADER_DUMP writes and
+// what ShaderBatchTool reads. A game's files never hold all of its shaders, so this is the half
+// that only a run of the game itself can supply.
+std::vector<ShaderBlob> LoadCorpus(const std::filesystem::path& folder, std::string& report);
+
 // The emulator's shader identity: XXH3_64bits over the code, as graphics/shader/shader.cpp
 // computes it. Two blobs with the same hash are the same shader, however many containers carry it.
 uint64_t ShaderHash(const ShaderBlob& blob);

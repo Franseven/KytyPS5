@@ -765,6 +765,39 @@ std::vector<ShaderBlob> EnumerateGame(const std::filesystem::path& game, std::st
 	return shaders;
 }
 
+// A folder of <hash>.header + <hash>.code pairs, the form the runtime dump and the batch tool share.
+// Only the extensions matter: the manifest is for the batch tool's driver, not for us.
+std::vector<ShaderBlob> LoadCorpus(const std::filesystem::path& folder, std::string& report) {
+	std::vector<std::filesystem::path> headers;
+	std::error_code                    code;
+	for (std::filesystem::directory_iterator it(folder, code), end; it != end; it.increment(code)) {
+		if (code) {
+			break;
+		}
+		if (it->is_regular_file(code) && it->path().extension() == ".header") {
+			headers.push_back(it->path());
+		}
+	}
+	std::sort(headers.begin(), headers.end());
+	std::vector<ShaderBlob> out;
+	size_t                  unreadable = 0;
+	out.reserve(headers.size());
+	for (const auto& path: headers) {
+		auto       header = ReadBytes(path);
+		const auto body   = ReadBytes(std::filesystem::path(path).replace_extension(".code"));
+		if (header.size() < 96 || body.empty()) {
+			unreadable++;
+			continue;
+		}
+		out.push_back({.header = std::vector<char>(header.begin(), header.end()),
+		               .code   = std::vector<char>(body.begin(), body.end()),
+		               .source = fmt::format("corpus:{}", path.stem().string())});
+	}
+	report += fmt::format("  corpus {}: {} shaders{}\n", folder.filename().string(), out.size(),
+	                      unreadable == 0 ? "" : fmt::format(", {} unreadable", unreadable));
+	return out;
+}
+
 // The draw's state the header does not hold gets the same defaults the batch tool has always used:
 // the input primitive that fits the header's GE_CNTL group size, identity pixel interpolators, the
 // default export mapping and stand-in vertex tables. A seeded module therefore matches the draws

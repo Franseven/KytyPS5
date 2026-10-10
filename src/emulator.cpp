@@ -29,6 +29,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
+#include <map>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -172,6 +174,20 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// The folder a game's shader corpus lives in, and the folder the dump writes. Both are relative to
+// the process's working directory for the same reason _ShaderCache is: each title gets its own.
+static std::filesystem::path CorpusDirectory(const std::string& title_id) {
+	return std::filesystem::path("_ShaderCorpus") / title_id;
+}
+
+static bool SetEnvironmentVariable(const char* name, const std::string& value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return ::_putenv_s(name, value.c_str()) == 0;
+#else
+	return ::setenv(name, value.c_str(), 1) == 0;
+#endif
+}
+
 // --precompile: every shader the game's own files hold (Offline::EnumerateGame), brought to the
 // point where a draw would hand it to the compiler, translated and stored in _ShaderCache by the
 // draw's own path (PipelineCache::SeedOffline). The device is the one the game would have got:
@@ -181,12 +197,28 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 // differs from the offline stand-ins (ShaderOffline.h) compiles as it does today, so this is a
 // head start and never a correctness question. The line per shader is machine readable: the
 // launcher counts the DISTINCT line for its denominator and the PROGRESS lines for the bar.
-static void PrecompileShaders(const std::filesystem::path& game) {
+static void PrecompileShaders(const std::filesystem::path& game, const std::string& title_id) {
 	auto* cache = Libs::Graphics::WindowPipelineCache();
 	EXIT_IF(cache == nullptr);
 
 	std::string report;
-	const auto  shaders = Libs::Graphics::Offline::EnumerateGame(game, report);
+	auto        shaders = Libs::Graphics::Offline::EnumerateGame(game, report);
+	// The shaders the game actually handed to AGC on an earlier run, kept by ShaderDumpConsider
+	// (libs/agc.cpp). They are the ones a game's own files do not hold, which for the engines that
+	// keep them in their data files is most of the race or the level: without this, --precompile
+	// covers the menu and the first minutes but nothing the game reaches later.
+	auto corpus = std::filesystem::path {};
+	if (const char* env = std::getenv("KYTY_SHADER_CORPUS"); env != nullptr && env[0] != '\0') {
+		corpus = env;
+	} else if (const auto kept = CorpusDirectory(title_id); std::filesystem::is_directory(kept)) {
+		corpus = kept;
+	}
+	if (!corpus.empty()) {
+		// The hash dedupe below drops the ones EnumerateGame already found.
+		auto loaded = Libs::Graphics::Offline::LoadCorpus(corpus, report);
+		shaders.insert(shaders.end(), std::make_move_iterator(loaded.begin()),
+		               std::make_move_iterator(loaded.end()));
+	}
 	::printf("SHADERS\t%zu\n%s", shaders.size(), report.c_str());
 	::fflush(stdout);
 
@@ -206,6 +238,11 @@ static void PrecompileShaders(const std::filesystem::path& game) {
 	::printf("DISTINCT\t%zu\n", distinct.size());
 	::fflush(stdout);
 
+	// A count of skips says nothing about what to do about them: the reasons, counted, do. The
+	// offline half can only stand in for the draws whose own state is its defaults (above), so the
+	// list is the measure of what a corpus alone can never cover.
+	std::map<std::string, size_t> skipped_why;
+
 	size_t seeded  = 0;
 	size_t skipped = 0;
 	for (size_t i = 0; i < distinct.size(); i++) {
@@ -219,11 +256,15 @@ static void PrecompileShaders(const std::filesystem::path& game) {
 			seeded++;
 		} else {
 			skipped++;
+			skipped_why[failure.empty() ? "SeedOffline refused it" : failure]++;
 		}
 		::printf("PROGRESS\t%zu\t%zu\t%s\n", i + 1, distinct.size(), ok ? "seeded" : "skipped");
 		::fflush(stdout);
 	}
 	cache->Save();
+	for (const auto& [why, count]: skipped_why) {
+		::printf("SKIP\t%zu\t%s\n", count, why.c_str());
+	}
 	::printf("PRECOMPILED\t%zu\t%zu\n", seeded, skipped);
 	::fflush(stdout);
 
@@ -275,8 +316,17 @@ void Run(const RunOptions& options) {
 	if (options.precompile) {
 		// The subsystems and the window unwind in the ordinary order as Run returns: nothing here
 		// needs the quick exit the guest path takes.
-		PrecompileShaders(options.app0_dir);
+		PrecompileShaders(options.app0_dir, title_id);
 		return;
+	}
+
+	// Running a game also keeps what the game hands to AGC, in _ShaderCorpus/<title id>
+	// (ShaderDumpConsider in libs/agc.cpp): a few thousand files of a few KB, one write per shader
+	// the emulator has not seen, and the only way a later --precompile can cover what the game's own
+	// files never hold. Set KYTY_SHADER_DUMP to another folder, or to 0 to turn the dump off.
+	if (std::getenv("KYTY_SHADER_DUMP") == nullptr && !title_id.empty()) {
+		SetEnvironmentVariable("KYTY_SHADER_DUMP",
+		                       Common::PathToString(CorpusDirectory(title_id)));
 	}
 
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
