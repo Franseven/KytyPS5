@@ -476,6 +476,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
+	m_dynamic_state.Invalidate();
 	return m_command;
 }
 

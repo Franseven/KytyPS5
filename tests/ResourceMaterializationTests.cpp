@@ -250,6 +250,98 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
+void TestSrtAliasesRetainReadPolicy() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0x1000u);
+  auto &block = *program.blocks[0];
+  const auto append_read = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    // Different reads deliberately share MemoryInfo but have different guest PCs.
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&read), slot});
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                      {Value(&srt), Value(slot)}));
+  };
+  const auto ordinary = append_read(0x2000u);
+  const auto pointer = append_read(0x3000u);
+  program.srt_reads[0].value.Instruction()->Arg(0).Instruction()->SetArg(0, pointer);
+  auto &mask = block.AppendNewInst(ValueOpcode::INotEqual32, {ordinary, Value(0u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                    {Value(9u), Value(&mask)});
+  program.descriptor_sources.push_back({.dwords = {Value(&first), Value(0u)},
+                                       .dword_count = 2});
+  DescriptorSource indirect;
+  indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(indirect);
+  auto plan = ExtractResourcePlan(program);
+  for (const auto &inst : plan.value_storage) {
+    Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
+              inst.GetOpcode() != ValueOpcode::GetSrtResource,
+          "retained plan still contains flattened-read aliases");
+  }
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value &&
+            plan.srt_reads[0].value.Instruction()->Flags<SrtReadFlags>().clean == 1u &&
+            plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
+            plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
+        "alias normalization lost read identity or retained discarded EXEC provenance");
+  struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (address == 0x2000u) words[0] = 0x2222u;
+        else if (address == 0x3000u) words[0] = 0x8000u;
+        else if (address == 0x8000u) words[0] = 0xeeeeu;
+        else return false;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (reads.dirty) return false;
+        if (address == 0x3000u) words[0] = 0x1000u;
+        else if (address == 0x1000u) words[0] = 0x1111u;
+        else return false;
+        return true;
+      }};
+  std::vector<uint32_t> flat;
+  DescriptorValue descriptor;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, &clean);
+    Check(walker.RefreshFlatBuffer(flat) &&
+              flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+              walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x1111u &&
+              reads.strict == 2 && reads.ordinary == 1,
+          "normalized aliases changed nested strict reads or repeated a shared read");
+  }
+  Check(!SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "strict flat read accepted a missing clean evaluator");
+  auto no_reader = runtime;
+  no_reader.read_specialization_memory = nullptr;
+  {
+    SrtWalker clean(plan, CleanRuntime(no_reader));
+    Check(!SrtWalker(plan, no_reader, &clean).RefreshFlatBuffer(flat),
+          "strict flat read accepted a missing strict reader");
+  }
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor) &&
+            descriptor.dwords[0] == 0xeeeeu && reads.strict == 2 && reads.ordinary == 3,
+        "direct descriptor evaluation without a clean evaluator changed read domains");
+  reads.dirty = true;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    Check(!SrtWalker(plan, runtime, &clean).RefreshFlatBuffer(flat) &&
+              reads.strict == 3 && reads.ordinary == 3,
+          "dirty strict pointer fell back to an ordinary read");
+  }
+}
+
 void TestUniformVectorDescriptorRead() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;

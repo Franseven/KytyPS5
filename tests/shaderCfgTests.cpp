@@ -2026,14 +2026,18 @@ void TestSopkCompareImmediateExtension() {
 
 void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
-  // Both debug branches fall through when conditional shader debugging is disabled.
+  // Debug branches fall through when conditional shader debugging is disabled.
   // Retain the post-ENDPGM helper displacement from PPSA08709 and exercise the
   // OR_USER variant encountered in PPSA03671 with the same body.
-  for (const auto opcode : {Decoder::Opcode::S_CBRANCH_CDBGSYS,
-                            Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER}) {
+  const std::pair<uint32_t, Decoder::Opcode> branches[] = {
+      {0x17, Decoder::Opcode::S_CBRANCH_CDBGSYS},
+      {0x18, Decoder::Opcode::S_CBRANCH_CDBGUSER},
+      {0x19, Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER},
+      {0x1a, Decoder::Opcode::S_CBRANCH_CDBGSYS_AND_USER}};
+  for (const auto [encoding, opcode] : branches) {
     std::array<uint32_t, 274> shader;
     shader.fill(EncodeSopp(0x00));
-    shader[0] = EncodeSopp(opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS ? 0x17 : 0x19, 0x10f);
+    shader[0] = EncodeSopp(encoding, 0x10f);
     shader[1] = EncodeVop1(0x01, 1, 129);
     shader[2] = EncodeMubuf0(0x1c, 0, false);
     shader[3] = EncodeMubuf1(1, 0, 0);
@@ -2043,6 +2047,7 @@ void TestDisabledDebugBranches() {
     Decoder::Program decoded;
     Decoder::DecodeProgram(shader, decoded);
     Check(decoded.instructions.front().opcode == opcode &&
+              decoded.instructions.front().opcode_id == encoding &&
               decoded.instructions.front().branch_target == 0x440u &&
               decoded.instructions.back().pc == 0x43cu &&
               decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
@@ -4871,34 +4876,92 @@ void TestNewShaderDecoderArchitecture() {
         "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
-void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
-  const uint32_t opcodes[] = {
-      0xa2u, 0xa5u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
-      0xf5u}; // eq_i64, ne_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
-  for (const auto opcode : opcodes) {
-    const uint32_t shader[] = {
-        EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
-        EncodeVop2Dpp(0u),
-        0xbf810000u,
-    };
-
-    ShaderRecompiler::Decoder::Program program;
-    ShaderRecompiler::Decoder::DecodeProgram(shader, program);
-    Check(program.instructions.size() == 2u,
-          "64-bit VOPC DPP decode did not consume its modifier word");
-    const auto &compare = program.instructions.front();
-    Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
-          "64-bit VOPC illegally accepted a DPP modifier");
-    Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
-          "64-bit VOPC DPP rejection reason was not explicit");
+void TestNewShaderRecompilerInteger64CompareEncodings() {
+  namespace D = ShaderRecompiler::Decoder;
+  using O = D::Opcode;
+  const O families[][8] = {
+      {O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_EQ_I64, O::V_CMP_LE_I64,
+       O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64, O::V_CMP_T_I64},
+      {O::V_CMPX_F_I64, O::V_CMPX_LT_I64, O::V_CMPX_EQ_I64, O::V_CMPX_LE_I64,
+       O::V_CMPX_GT_I64, O::V_CMPX_NE_I64, O::V_CMPX_GE_I64, O::V_CMPX_T_I64},
+      {O::V_CMP_F_U64, O::V_CMP_LT_U64, O::V_CMP_EQ_U64, O::V_CMP_LE_U64,
+       O::V_CMP_GT_U64, O::V_CMP_NE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64},
+      {O::V_CMPX_F_U64, O::V_CMPX_LT_U64, O::V_CMPX_EQ_U64, O::V_CMPX_LE_U64,
+       O::V_CMPX_GT_U64, O::V_CMPX_NE_U64, O::V_CMPX_GE_U64, O::V_CMPX_T_U64}};
+  const uint32_t bases[] = {0xa0u, 0xb0u, 0xe0u, 0xf0u};
+  for (uint32_t family = 0; family < std::size(families); ++family) {
+    const bool update_exec = (family % 2) != 0;
+    for (uint32_t predicate = 0; predicate < 8; ++predicate) {
+      const auto encoding = bases[family] + predicate;
+      for (const bool vop3 : {false, true}) {
+        const std::array<uint32_t, 2> words = vop3
+            ? std::array{EncodeVop3Word0(encoding, 20),
+                         EncodeVop3Word1(257, 259, 0)}
+            : std::array{EncodeVopc(encoding, 257, 3), 0xbf810000u};
+        D::Instruction compare;
+        D::DecodeInstruction(words, 0, compare);
+        const auto destination = update_exec ? D::OperandKind::ExecLo
+            : vop3 ? D::OperandKind::Sgpr : D::OperandKind::VccLo;
+        Check(compare.family == (vop3 ? D::Family::VOP3 : D::Family::VOPC) &&
+                  compare.opcode == families[family][predicate] &&
+                  compare.opcode_id == encoding &&
+                  compare.word_count == (vop3 ? 2u : 1u) &&
+                  compare.dst.kind == destination &&
+                  (!vop3 || update_exec || compare.dst.reg == 20) &&
+                  compare.src_count == 2 &&
+                  compare.src0.kind == D::OperandKind::Vgpr && compare.src0.reg == 1 &&
+                  compare.src1.kind == D::OperandKind::Vgpr && compare.src1.reg == 3,
+              "64-bit integer compare decoded incorrectly");
+        for (const bool high_src0 : {false, true}) {
+          // Only the compare's pair width makes v13 reachable by MOVRELD,
+          // including predicates F/T that never read their operands.
+          const uint32_t src0 = high_src0 ? 268u : 266u;
+          const uint32_t src1 = high_src0 ? 10u : 12u;
+          std::vector<uint32_t> shader{EncodeVop1(0x42, 12, 256)};
+          if (vop3) {
+            shader.push_back(EncodeVop3Word0(encoding, 20));
+            shader.push_back(EncodeVop3Word1(src0, src1 + 256, 0));
+          } else {
+            shader.push_back(EncodeVopc(encoding, src0, src1));
+          }
+          shader.push_back(EncodeSopp(0x01));
+          D::Program decoded;
+          D::DecodeProgram(shader, decoded);
+          ShaderComputeInputInfo compute{};
+          ShaderRecompiler::Frontend::TranslateOptions options{.stage = ShaderType::Compute};
+          options.input_info.compute = &compute;
+          const auto program = ShaderRecompiler::Frontend::TranslateProgram(
+              decoded, ShaderRecompiler::CFG::BuildGraph(decoded), options);
+          bool includes_high_word = false;
+          for (const auto *block : program.blocks) {
+            for (const auto &inst : *block) {
+              includes_high_word |=
+                  inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetVectorRegister &&
+                  ShaderRecompiler::IR::RegIndex(inst.Arg(0).VectorRegister()) == 13;
+            }
+          }
+          Check(includes_high_word, "64-bit compare omitted a VGPR pair's high word");
+        }
+      }
+      for (const bool dpp : {false, true}) {
+        const uint32_t shader[] = {
+            EncodeVopc(encoding, dpp ? 250u : 249u, 3),
+            dpp ? EncodeVop2Dpp(1) : EncodeVopcSdwa(1),
+            0xbf810000u};
+        D::Program program;
+        D::DecodeProgram(shader, program);
+        Check(program.instructions.size() == 2u &&
+                  program.instructions.back().opcode == O::S_ENDPGM,
+              "64-bit VOPC decode did not consume its modifier word");
+        const auto &compare = program.instructions.front();
+        const auto reason = dpp ? "VOPC DPP modifier is not supported for opcode"
+                                : "VOPC SDWA modifier is not supported for opcode";
+        Check(compare.opcode == O::UNSUPPORTED && compare.word_count == 2u &&
+                  compare.unsupported_reason.find(reason) != std::string::npos,
+              "64-bit VOPC did not explicitly reject an illegal modifier");
+      }
+    }
   }
-  const uint32_t sdwa[] = {EncodeVopc(0xa5u, 249u, 0u), 0x06060000u};
-  ShaderRecompiler::Decoder::Instruction compare;
-  ShaderRecompiler::Decoder::DecodeInstruction(sdwa, 0u, compare);
-  Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED &&
-            compare.word_count == 2u &&
-            compare.unsupported_reason.find("VOPC SDWA modifier is not supported") != std::string::npos,
-        "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
@@ -13910,6 +13973,278 @@ void TestGpuProducedWritableDescriptor() {
         "GPU-updated address or record count created a shader permutation");
 }
 
+void TestImmutableDescriptorPredicate() {
+  using namespace ShaderRecompiler::IR;
+  ResourcePlan plan;
+  const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
+    auto &inst = plan.value_storage.emplace_back(op);
+    uint32_t index = 0;
+    for (const auto arg : args) inst.SetArg(index++, arg);
+    return Value(&inst);
+  };
+  const auto handle = emit(ValueOpcode::GetBufferResource,
+                           {Value(0x1000u), Value(4u << 16u), Value(16u), Value(0u)});
+  for (const bool coherent : {false, true}) {
+    plan.memory_info.push_back({.kind = ResourceKind::Buffer,
+                                .idxen = !coherent, .coherent = coherent});
+    const auto loaded = emit(ValueOpcode::LoadBufferU32,
+                              {handle, Value(0u), Value(0u), Value(0u), Value(true)});
+    loaded.ResolveInstruction()->SetFlags(MemoryFlags{
+        .index = static_cast<uint32_t>(plan.memory_info.size() - 1u)});
+    const auto mask = emit(ValueOpcode::INotEqual32, {loaded, Value(0u)});
+    const auto selected = emit(ValueOpcode::SelectU32, {mask, Value(1u), Value(0u)});
+    const auto reduced = emit(ValueOpcode::ReadFirstLane, {selected, mask});
+    Check(ValidateRuntimeValue(plan, reduced, RuntimeValueType::Integer),
+          "integer EXEC reduction lost its active-lane proof");
+    Check(!ValidateRuntimeValue(plan, reduced, RuntimeValueType::ImmutableInteger),
+          "memory-dependent EXEC reduction was classified as immutable");
+  }
+}
+
+void TestUniformSelectedWritableDescriptor() {
+  using namespace ShaderRecompiler::IR;
+  // SAROS b9da5e64f4c5b10a builds s[8:11] from two scalar address expressions,
+  // then sets the stride in the high address word after the branch merge.
+  const uint32_t shader[] = {
+      0xbfa00002u, 0xbf070280u, 0xbf84000du, 0xf4001a82u,
+      0xfa00009cu, 0xbf8cc07fu, 0x8f6b856au, 0xf4001a82u,
+      0xfa000080u, 0xbf8cc07fu, 0x98eb6b6au, 0xb7eb0080u,
+      0x80086b03u, 0xbf800000u, 0x82098000u, 0xbf820006u,
+      0xf4041a82u, 0xfa000040u, 0xbf8cc07fu, 0x8008066au,
+      0xbf800000u, 0x8209016bu, 0xd7460001u, 0x04010c07u,
+      0x7e000280u, 0xf4001a82u, 0xfa000084u, 0xbf8cc07fu,
+      0x810a846au, 0xbe8b03ffu, 0x00016204u, 0x4a020284u,
+      0xbe891d92u, 0xe0702000u, 0x80020001u, 0xbf810000u,
+  };
+  std::array<uint32_t, 8> user_data{0x30u, 0x1cu, 1u, 0xfffffff0u,
+                                     0x1000u, 0u, 0xfffffffcu, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written,
+        "uniform address selection lost its writable buffer");
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    const bool alternate = *static_cast<uint32_t *>(data) == 0;
+    if (words.size() != 1) return false;
+    switch (address) {
+    case 0x1040: words[0] = 8u; return alternate;
+    case 0x1044: words[0] = 1u; return alternate;
+    case 0x1080: words[0] = 3u; return !alternate;
+    case 0x109c: words[0] = 2u; return !alternate;
+    case 0x1084: words[0] = 10u; return true;
+    default: return false;
+    }
+  };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
+                           .userdata = &user_data[2], .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t flag : {1u, 0u, 1u}) {
+    user_data[2] = flag;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "uniform selection evaluated an unavailable untaken scalar source");
+    const auto &descriptor = snapshot.buffers[0].dwords;
+    Check(descriptor[0] == (flag ? 0xe0u : 4u) &&
+              descriptor[1] == (flag ? 0x40031u : 0x4001eu) &&
+              descriptor[2] == 14u && descriptor[3] == 0x16204u,
+          "uniform writable descriptor lost its branch, carry, or post-merge stride");
+  }
+}
+
+void TestUniformSelectedDescriptorLoadAddress() {
+  using namespace ShaderRecompiler::IR;
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),     // s_cmp_eq_u32 s0, 0
+      EncodeSopp(0x04, 2),         // s_cbranch_scc0 alternate
+      EncodeSop1(0x04, 6, 2),      // s_mov_b64 s[6:7], s[2:3]
+      EncodeSopp(0x02, 1),         // s_branch load
+      EncodeSop1(0x04, 6, 4),      // s_mov_b64 s[6:7], s[4:5]
+      EncodeSmem0(0x02, 8, 3), 125u << 25u, // s_load_dwordx4 s[8:11], s[6:7], 0
+      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 6> user_data{0u, 0u, 0x1000u, 0u, 0x2000u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.srt_reads.size() == 4u && plan.info.buffers.size() == 1u &&
+            plan.info.buffers[0].written && !plan.capture_specialization_reads,
+        "conditional scalar address duplicated or detached descriptor reads");
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    const auto flag = *static_cast<uint32_t *>(data);
+    const uint64_t base = flag ? 0x2000u : 0x1000u;
+    const std::array<uint32_t, 4> descriptor{0x3000u + flag * 0x1000u,
+                                            4u << 16u, 16u, 0x16204u};
+    if (words.size() != 1u || address < base || address >= base + 16u ||
+        (address & 3u) != 0u) return false;
+    words[0] = descriptor[(address - base) / 4u];
+    return true;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
+                           .userdata = &user_data[0]};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t flag : {0u, 1u, 0u}) {
+    user_data[0] = flag;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[0] == 0x3000u + flag * 0x1000u &&
+              snapshot.specialization_reads.empty(),
+          "conditional descriptor load read the untaken pointer");
+  }
+}
+
+void TestBoundedScalarMaterialImageKeys() {
+  using namespace ShaderRecompiler::IR;
+  // SAROS 9fba2edffc549531: min(header count,64), scalar rows of 160 bytes,
+  // and separate float/uint image fields at 0x7c/0x94 in the same image heap.
+  std::vector<uint32_t> shader {
+      0xf4080106u, 0xfa0000a0u, 0xf4080806u, 0xfa0000b0u,
+      0xbf8cc07fu, 0xf4201550u, 0xfa000024u, 0xbf8cc07fu,
+      EncodeSop2(0x07, 85, 85, 0xc0), EncodeSMovB32(86, 128),
+      EncodeSMovB32(87, 126),
+  };
+  const auto loop = shader.size();
+  shader.insert(shader.end(), {0x7da2aaf9u, 0x86860056u, EncodeSopp(0x08),
+      0x931cff56u, 0x000000a0u, 0xf42006c2u, 0x38000094u,
+      0xf4200682u, 0x3800007cu, 0xbf8cc07fu, 0x8f58851bu, 0x8f3c851au,
+      0xf42c1304u, 0xb0000000u, 0xf42c0d04u, 0x78000000u, 0xbf8cc07fu,
+      0xf0000110u, 0x00130106u, 0xf0000110u, 0x000d0206u,
+      EncodeVop1(0x01, 3, 78), // Preserve a T# dimension word as native scalar payload.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0),
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(2, 0, 0),
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(3, 0, 0),
+      EncodeSop2(0x02, 86, 86, 129), EncodeSMovB32(126, 87),
+      EncodeSopp(0x02)});
+  shader.back() = EncodeSopp(0x02, static_cast<uint16_t>(loop - shader.size()));
+  shader[loop + 2u] = EncodeSopp(0x08, shader.size() - loop - 3u);
+  shader.push_back(EncodeSopp(0x01));
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x100000u;
+  user_data[9] = 32u << 16u;
+  user_data[10] = 198656u;
+  user_data[11] = 0x5204u;
+  user_data[12] = 0x1000u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.images.size() == 2 && plan.capture_specialization_reads,
+        "scalar material fields lost their distinct image roots or clean read capture");
+  for (const auto &image : plan.info.images) {
+    const auto &source = plan.descriptor_sources[image.source].indirect_descriptor;
+    Check(source && source->selector && source->selector->stride == 160u &&
+              (source->selector->offset == 0x7cu || source->selector->offset == 0x94u) &&
+              source->table_stride == 32u && !source->table_scalar &&
+              source->key_count.ResolveInstruction()->GetOpcode() == ValueOpcode::UMin32,
+          "scalar material image selection fell back to the whole heap");
+  }
+  Check(std::ranges::any_of(translated.program.blocks, [&](const auto *block) {
+    return std::ranges::any_of(*block, [&](const auto &inst) {
+      if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) return false;
+      const auto &memory = translated.program.memory_info[inst.template Flags<MemoryFlags>().index];
+      return memory.component_count == 8u && memory.component_index == 2u &&
+             !memory.planning_only && inst.HasUses();
+    });
+  }), "scalar material projection removed a live T# dimension payload");
+  struct Memory {
+    uint32_t count = 2;
+    uint32_t stride = 160;
+    uint32_t records = 409;
+    uint64_t unavailable = 0;
+    bool clean = true;
+    bool mixed = false;
+    bool same_key = false;
+    uint32_t keys = 0;
+    uint32_t images = 0;
+  } memory;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    if (!m.clean || address == m.unavailable) return false;
+    if (words.size() == 1 && address >= 0x10a0u && address < 0x10c0u) {
+      const uint32_t descriptors[] = {0x2000u, m.stride << 16u, m.records, 0x5204u,
+                                     0x4000u, 16u << 16u, 8u, 0x4dfacu};
+      words[0] = descriptors[(address - 0x10a0u) / 4u];
+      return true;
+    }
+    if (address == 0x4024u && words.size() == 1) { words[0] = m.count; return true; }
+    for (const uint32_t row : {0u, 1u}) {
+      for (const uint32_t field : {0x7cu, 0x94u}) {
+        if (address != 0x2000u + row * 160u + field || words.size() != 1) continue;
+        ++m.keys;
+        words[0] = (row == 0 || m.same_key ? 5582u : 5567u) + (field == 0x94u ? 6u : 0u);
+        return true;
+      }
+    }
+    for (const uint32_t key : {5567u, 5582u, 5573u, 5588u}) {
+      if (address != 0x100000u + key * 32u || words.size() != 8) continue;
+      ++m.images;
+      std::ranges::fill(words, 0u);
+      words[0] = key;
+      const bool integer = key == 5573u || key == 5588u;
+      words[1] = static_cast<uint32_t>(integer && !(m.mixed && key == 5573u)
+          ? Prospero::BufferFormat::k32UInt : Prospero::BufferFormat::k32Float) << 20u;
+      words[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor3D) << 28u);
+      return true;
+    }
+    return false;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t stride : {160u, 16u}) {
+    memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 4,
+          "scalar material selection used V# stride as its instruction stride or scanned unused keys");
+    for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
+      const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
+      const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
+      const auto offset = specialization.images[root].indirect_mapping_offset;
+      Check(snapshot.flattened_srt[offset] == 2u &&
+                snapshot.flattened_srt[offset + 1u] == first &&
+                snapshot.flattened_srt[offset + 3u] == first + 15u,
+            "scalar material image mapping changed descriptor-index keys into byte offsets");
+    }
+  }
+  for (const bool same_key : {false, true}) {
+    memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.keys == (same_key ? 4u : 2u) && memory.images == 2 &&
+              snapshot.images.size() == 2 &&
+              std::ranges::all_of(specialization.images, [](const auto &image) {
+                return image.indirect_root == ImageResource::NoIndirectImage;
+              }), "single-candidate scalar material loop retained an indirect image mapping");
+  }
+  memory = {.count = 0};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.keys == 0 && memory.images == 0 && snapshot.images.size() == 2,
+        "empty scalar material loop retained image probes");
+  memory = {.clean = false};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "dirty scalar material proof was accepted");
+  memory = {.unavailable = 0x2094u};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unavailable selected material key was accepted");
+  memory = {.stride = 1, .records = 311};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.keys == 0,
+        "scalar material byte range escaped V# bounds");
+  memory = {.mixed = true};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "selected material fields bypassed image compatibility");
+  memory = {};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "native scalar material image selection did not recover after rejected candidates");
+  ApplyResourceSpecialization(translated.program, specialization);
+  Check(translated.program.info.images.size() == 4 &&
+            translated.program.info.images[0].indirect_resources.size() == 2 &&
+            translated.program.info.images[1].indirect_resources.size() == 2,
+        "native image reads lost their distinct material field dispatches");
+}
+
 void TestTypedDescriptorRealCarryAndScalarLoads() {
   const uint32_t carry_shader[] = {
       EncodeSop1(0x1f, 0, 0),      // s_getpc_b64 s[0:1]
@@ -15243,7 +15578,7 @@ int main() {
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
-  TestNewShaderRecompilerRejectsDppOn64BitCompares();
+  TestNewShaderRecompilerInteger64CompareEncodings();
   TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
@@ -15346,6 +15681,10 @@ int main() {
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
   TestGpuProducedWritableDescriptor();
+  TestUniformSelectedWritableDescriptor();
+  TestUniformSelectedDescriptorLoadAddress();
+  TestBoundedScalarMaterialImageKeys();
+  TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();

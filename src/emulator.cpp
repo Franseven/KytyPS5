@@ -12,6 +12,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/ShaderOffline.h"
 #include "kernel/fileSystem.h"
@@ -143,6 +144,9 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		    flexible_memory_size != 0) {
 			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 		}
+	}
+	if (cfg.splash_enabled) {
+		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
