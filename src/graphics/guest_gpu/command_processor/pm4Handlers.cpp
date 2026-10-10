@@ -1924,8 +1924,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	const uint32_t control_flags = control & 0x0fe00000u;
 	if (control_flags != 0x0f200000u) {
-		LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
-		     control_flags);
+		// One line per indirect buffer per frame: 304000 lines in two minutes of Gran Turismo 7,
+		// each an fwrite and an fflush. The first calls say what the flags are; the rest say nothing
+		// new, so this keeps the first 128, as the address log below always has.
+		static std::atomic<uint32_t> flags_log_count {0};
+		if (flags_log_count.fetch_add(1) < 128) {
+			LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
+			     control_flags);
+		}
 	}
 
 	auto* indirect_buffer =

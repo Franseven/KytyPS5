@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -2069,12 +2070,23 @@ int KYTY_SYSV_ABI FontWritingLineGetRenderMetrics(FontWritingLine     writing_li
 	return OK;
 }
 
+// One call per glyph per frame: GT7 asks for every character it draws, which was 300.000 lines and
+// 34 MB of log in 40 s at 60 fps, each line costing an fwrite and an fflush. The first calls are
+// kept (that is where a wrong handle shows up) and then one in 600, as KernelDlsym does.
+static bool FontMetricsCallWorthLogging() {
+	static std::atomic_uint32_t log_count = 0;
+	const auto                  index     = log_count.fetch_add(1, std::memory_order_relaxed);
+	return index < 32 || (index % 600) == 0;
+}
+
 int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                                 FontGlyphMetrics* metrics) {
 	PRINT_NAME();
 
-	LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));
+	if (FontMetricsCallWorthLogging()) {
+		LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));
+	}
 
 	fill_metrics_for_code(metrics, static_cast<FontState*>(font_handle), code);
 
@@ -2119,8 +2131,10 @@ int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
 
-	LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));
+	if (FontMetricsCallWorthLogging()) {
+		LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));
+	}
 
 	fill_metrics_for_code(metrics, static_cast<FontState*>(font_handle), code);
 
