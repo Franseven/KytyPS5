@@ -123,6 +123,24 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
                      : std::array<float, 6>{1, 1, 1, -1, -1, -1};
     for (u32 i = 0; i < 6; ++i) data[NodeStart + 68 + child * 6 + i] = bits(bounds[i]);
   }
+  // A PS5 type-6 (shared-exponent) box node at index 6: the same four boxes as the FP32 node, on a
+  // per-axis shared exponent. Node 0 is the triangle, hence the pointer 54 = index 6 | type 6.
+  constexpr u32 SharedNode = 6, SharedPointer = (SharedNode << 3) | 6;
+  constexpr std::array<u32, 4> z_grid{5 * 8192u, 1 * 8192u, 3 * 8192u, 7 * 8192u};
+  const auto put = [&](u32 base, u32 first, u32 count, u32 value) {
+    for (u32 i = 0; i < count; ++i)
+      data[base + (first + i) / 32u] |= ((value >> i) & 1u) << ((first + i) % 32u);
+  };
+  const auto shared = NodeStart + SharedNode * 16;
+  put(shared, 0, 29, 17);   // first child at unit 17, all four one unit apart
+  put(shared, 56, 8, 127);  // x shared exponent
+  put(shared, 64, 8, 127);  // y shared exponent
+  put(shared, 72, 8, 130);  // z shared exponent: the 2^-13 grid makes z*8192 exact
+  for (u32 child = 0; child < 4; ++child) {
+    const std::array<u32, 6> fields{(1u << 17) | 0x10000u, (1u << 17) | 0x10000u, z_grid[child],
+                                    0x10000u, 0x10000u, z_grid[child] + 8192u};
+    for (u32 k = 0; k < 6; ++k) put(shared, 80 + 18 * (6 * child + k), 18, fields[k]);
+  }
   // An FP32 node straddles two guest pages with a 64-byte gap in physical backing.
   std::copy_n(data.begin() + NodeStart + 32, 16, data.begin() + NodeStart + 255 * 16);
   std::copy_n(data.begin() + NodeStart + 48, 16, data.begin() + NodeStart + 257 * 16);
@@ -131,7 +149,8 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   for (u32 lane = 0; lane < LaneCount; ++lane) {
     const auto kind = lane % 8;
     const auto input = lane * 16;
-    data[input] = kind < 4 ? kind : kind == 4 ? 12 : kind == 5 ? 21 : kind == 6 ? 6 : 0x1000;
+    data[input] = kind < 4 ? kind : kind == 4 ? 12 : kind == 5 ? 21 : kind == 6 ? SharedPointer
+                                                                              : 0x1000;
     data[input + 1] = bits(6);
     data[input + 2] = bits(kind < 4 ? origins[kind][0] : 0);
     data[input + 3] = bits(kind < 4 ? origins[kind][1] : 0);
@@ -145,12 +164,13 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
       expected[lane] = {bits(2 * denominator), bits(denominator),
                         barycentrics ? bits(i) : Flag + kind,
                         barycentrics ? bits(j) : 1};
-    } else if (kind < 6) {
+    } else if (kind < 7) {
+      // Types 4 (f16), 5 (f32) and the PS5 shared-exponent 6 resolve the same four boxes to the
+      // same child pointers; a type 7 pointer is out of range.
       expected[lane] = sorted ? std::array<u32, 4>{children[1], children[2], children[0], Invalid}
                               : std::array<u32, 4>{children[0], children[1], children[2], Invalid};
     } else {
-      expected[lane] = kind == 6 ? std::array<u32, 4>{Invalid, Invalid, Invalid, Invalid}
-                                 : std::array<u32, 4>{Infinity, bits(1), Invalid, 0};
+      expected[lane] = {Infinity, bits(1), Invalid, 0};
     }
     if (lane >= 8 && lane < 12) {
       data[input + 2] = 0x7fc00000; // invalid ray origin
@@ -201,10 +221,16 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   }
   test.expected = test.initial;
   for (u32 lane = 0; lane < LaneCount; ++lane) {
+    const auto input = lane * 16;
     std::copy(expected[lane].begin(), expected[lane].end(),
               test.expected.begin() + OutputStart + lane * 4);
     auto bounded = expected[lane];
-    if (lane % 8 == 5) bounded = {Invalid, Invalid, Invalid, Invalid};
+    // The second dispatch narrows the BVH to two nodes, so the lanes whose node lies beyond index
+    // one -- the FP32 type 5 at index 2, and the PS5 shared-exponent type 6 at index 6 -- report
+    // the box-invalid sentinel there. Keying on the pointer's type also covers lane 22.
+    const auto node_type = data[input] & 7u;
+    if ((node_type == 5u || node_type == 6u) && !(wide && lane >= 14 && lane < 16))
+      bounded = {Invalid, Invalid, Invalid, Invalid};
     if (lane >= 20) bounded = {0x12345678, 0x12345679, 0x1234567a, 0x1234567b};
     std::copy(bounded.begin(), bounded.end(),
               test.expected.begin() + OutputStart + LaneCount * 4 + lane * 4);

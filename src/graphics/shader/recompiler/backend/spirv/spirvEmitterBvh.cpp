@@ -27,6 +27,102 @@ uint32_t NodeWord(EmitterState& s, uint32_t block, uint32_t word) {
 	return result;
 }
 
+// `count` bits starting at bit `first` of the 64-byte node at `block`. Every caller passes a
+// compile-time bit position, so the shifts and the mask fold away.
+uint32_t NodeBits(EmitterState& s, uint32_t block, uint32_t first, uint32_t count) {
+	const auto u = TypeU32(s), word = first / 32u, shift = first % 32u;
+	auto value = NodeWord(s, block, ConstantU32(s, word));
+	if (shift != 0u)
+		value = Binary(s, spv::OpShiftRightLogical, u, value, ConstantU32(s, shift));
+	if (shift + count > 32u)
+		value = Binary(s, spv::OpBitwiseOr, u, value,
+		    Binary(s, spv::OpShiftLeftLogical, u, NodeWord(s, block, ConstantU32(s, word + 1u)),
+		           ConstantU32(s, 32u - shift)));
+	return Binary(s, spv::OpBitwiseAnd, u, value, ConstantU32(s, (1u << count) - 1u));
+}
+
+// One bound of a PS5 type-6 node (the shared-exponent box): an 18-bit sign-magnitude `field` (bit
+// 17 is the sign) on the fixed grid of the axis' shared biased `exponent`, renormalized to f32.
+// The low mantissa bits the shift truncates are filled with ones when the bound rounds away from
+// zero (minima towards -inf, maxima towards +inf), so the box only ever grows. Integer only.
+uint32_t SharedExpBound(EmitterState& s, uint32_t field, uint32_t exponent, bool is_min) {
+	const auto u = TypeU32(s), b = TypeBool(s);
+	const auto sign = Binary(s, spv::OpShiftRightLogical, u, field, ConstantU32(s, 17));
+	const auto magnitude = Binary(s, spv::OpBitwiseAnd, u, field, ConstantU32(s, 0x1ffffu));
+	const auto negative = Binary(s, spv::OpINotEqual, b, sign, ConstantU32(s, 0));
+	const auto away = is_min ? negative : Unary(s, spv::OpLogicalNot, b, negative);
+	// A nonzero magnitude shifts its leading one up to the implicit bit, lowering the exponent (not
+	// below zero: the result is denormal then). FindUMsb yields -1 for a zero magnitude, so `lead`
+	// wraps to 17 and `down` becomes min(17, exponent) -- the constant case handled further down.
+	const auto msb = EmitGlsl<GLSLstd450FindUMsb, IR::Type::U32>(s, magnitude);
+	const auto lead = Binary(s, spv::OpISub, u, ConstantU32(s, 16), msb);
+	const auto down = Select(s, u, Binary(s, spv::OpULessThan, b, lead, exponent), lead, exponent);
+	const auto exp_n = Binary(s, spv::OpISub, u, exponent, down);
+	const auto shift = Binary(s, spv::OpIAdd, u, ConstantU32(s, 7), down);
+	const auto fill = Select(s, u,
+	    Binary(s, spv::OpLogicalAnd, b, away,
+	           Binary(s, spv::OpINotEqual, b, exp_n, ConstantU32(s, 0xffu))),
+	    Binary(s, spv::OpISub, u,
+	           Binary(s, spv::OpShiftLeftLogical, u, ConstantU32(s, 1), shift), ConstantU32(s, 1)),
+	    ConstantU32(s, 0));
+	const auto mant_n = Binary(s, spv::OpBitwiseAnd, u,
+	    Binary(s, spv::OpBitwiseOr, u,
+	           Binary(s, spv::OpShiftLeftLogical, u, magnitude, shift), fill),
+	    ConstantU32(s, 0x7fffffu));
+	// A zero magnitude rounding away is mantissa 0x7fffff at exp_n; otherwise a signed zero.
+	const auto zero = Binary(s, spv::OpIEqual, b, magnitude, ConstantU32(s, 0));
+	const auto mant = Select(s, u, Binary(s, spv::OpLogicalAnd, b, zero, away),
+	                         ConstantU32(s, 0x7fffffu), mant_n);
+	const auto exp = Select(s, u,
+	    Binary(s, spv::OpLogicalAnd, b, zero, Unary(s, spv::OpLogicalNot, b, away)),
+	    ConstantU32(s, 0), exp_n);
+	return Unary(s, spv::OpBitcast, TypeF32(s), Binary(s, spv::OpBitwiseOr, u,
+	    Binary(s, spv::OpBitwiseOr, u,
+	           Binary(s, spv::OpShiftLeftLogical, u, sign, ConstantU32(s, 31)),
+	           Binary(s, spv::OpShiftLeftLogical, u, exp, ConstantU32(s, 23))),
+	    mant));
+}
+
+// The four child pointers of a PS5 type-6 node: bits 0-28 hold the first child's base in 64-byte
+// units, each following child starts `SharedExpUnits(type)` blocks after the previous one, and the
+// two bits at 41+2c mark a child absent when they are 3.
+std::array<uint32_t, 4> BoxChildren6(EmitterState& s, uint32_t block) {
+	const auto u = TypeU32(s), b = TypeBool(s);
+	auto running = Binary(s, spv::OpBitwiseAnd, u, NodeWord(s, block, ConstantU32(s, 0)),
+	                      ConstantU32(s, 0x1fffffffu));
+	std::array<uint32_t, 4> children;
+	for (uint32_t child = 0; child < 4; ++child) {
+		const auto type = NodeBits(s, block, 29u + 3u * child, 3u);
+		const auto empty = Binary(s, spv::OpIEqual, b, NodeBits(s, block, 41u + 2u * child, 2u),
+		                          ConstantU32(s, 3));
+		children[child] = Select(s, u, empty, ConstantU32(s, ~0u),
+		    Binary(s, spv::OpBitwiseOr, u,
+		           Binary(s, spv::OpShiftLeftLogical, u, running, ConstantU32(s, 3)), type));
+		const auto is_type = [&](uint32_t value) {
+			return Binary(s, spv::OpIEqual, b, type, ConstantU32(s, value));
+		};
+		const auto units = Select(s, u, is_type(2), ConstantU32(s, 4),
+		    Select(s, u, Binary(s, spv::OpLogicalOr, b, is_type(3),
+		                        Binary(s, spv::OpLogicalOr, b, is_type(5), is_type(6))),
+		           ConstantU32(s, 2), ConstantU32(s, 1)));
+		running = Binary(s, spv::OpIAdd, u, running, units);
+	}
+	return children;
+}
+
+// The six bounds (lo xyz then hi xyz) of one type-6 child: the three shared exponents at bits
+// 56/64/72 and the child's six 18-bit fields from bit 80.
+std::array<uint32_t, 6> Box6(EmitterState& s, uint32_t block, uint32_t child) {
+	std::array<uint32_t, 3> exponent;
+	for (uint32_t axis = 0; axis < 3; ++axis)
+		exponent[axis] = NodeBits(s, block, 56u + 8u * axis, 8u);
+	std::array<uint32_t, 6> result;
+	for (uint32_t k = 0; k < 6; ++k)
+		result[k] = SharedExpBound(s, NodeBits(s, block, 80u + 18u * (6u * child + k), 18u),
+		                           exponent[k % 3u], k < 3u);
+	return result;
+}
+
 uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
                   Vec3 origin, Vec3 direction) {
 	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
@@ -161,8 +257,9 @@ std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
 	return result;
 }
 
-uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
-               uint32_t grow, uint32_t sort, uint32_t extent, const Vec3& origin, const Vec3& inverse) {
+uint32_t BoxSlabs(EmitterState& s, const std::array<std::array<uint32_t, 6>, 4>& bounds,
+                  const std::array<uint32_t, 4>& pointers, uint32_t grow, uint32_t sort,
+                  uint32_t extent, const Vec3& origin, const Vec3& inverse) {
 	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
 	const auto zero = ConstantF32Value(s, 0.0f);
 	std::array<uint32_t, 4> depths, indices;
@@ -170,7 +267,7 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 	for (uint32_t axis = 0; axis < 3; ++axis)
 		forward[axis] = Binary(s, spv::OpFOrdGreaterThanEqual, b, inverse[axis], zero);
 	for (uint32_t child = 0; child < 4; ++child) {
-		const auto box = Box(s, first, second, half, child);
+		const auto& box = bounds[child];
 		Vec3 near, far;
 		for (uint32_t axis = 0; axis < 3; ++axis) {
 			const auto lo = Binary(s, spv::OpFMul, f,
@@ -198,7 +295,7 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 		depths[child] = Unary(s, spv::OpBitcast, u, Select(s, f, hit,
 		    Select(s, f, Binary(s, spv::OpFOrdGreaterThan, b, entry, zero), entry, zero),
 		    ConstantF32(s, 0x7f800000)));
-		indices[child] = Select(s, u, hit, NodeWord(s, first, ConstantU32(s, child)), ConstantU32(s, ~0u));
+		indices[child] = Select(s, u, hit, pointers[child], ConstantU32(s, ~0u));
 	}
 	// A select network keeps the original child order when sorting is disabled.
 	constexpr std::array<std::pair<uint32_t, uint32_t>, 5> network {{{0,1}, {2,3}, {0,2}, {1,3}, {1,2}}};
@@ -218,6 +315,28 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 		indices[c] = Select(s, u, swap, index, indices[c]);
 	}
 	return Vector(s, TypeU32Vector(s, 4), indices);
+}
+
+// RDNA2 box nodes: the four child pointers are the node's first four dwords, and the bounds live
+// in the same block (half floats, node type 4) or the block after it (f32, node type 5).
+uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
+               uint32_t grow, uint32_t sort, uint32_t extent, const Vec3& origin, const Vec3& inverse) {
+	std::array<std::array<uint32_t, 6>, 4> bounds;
+	std::array<uint32_t, 4> pointers;
+	for (uint32_t child = 0; child < 4; ++child) {
+		bounds[child] = Box(s, first, second, half, child);
+		pointers[child] = NodeWord(s, first, ConstantU32(s, child));
+	}
+	return BoxSlabs(s, bounds, pointers, grow, sort, extent, origin, inverse);
+}
+
+// PS5 type-6 box node: children and their shared-exponent bounds all in this one 64-byte block.
+uint32_t Boxes6(EmitterState& s, uint32_t first, uint32_t grow, uint32_t sort, uint32_t extent,
+                const Vec3& origin, const Vec3& inverse) {
+	std::array<std::array<uint32_t, 6>, 4> bounds;
+	for (uint32_t child = 0; child < 4; ++child)
+		bounds[child] = Box6(s, first, child);
+	return BoxSlabs(s, bounds, BoxChildren6(s, first), grow, sort, extent, origin, inverse);
 }
 
 } // namespace
@@ -257,6 +376,8 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto triangle = Binary(s, spv::OpULessThan, b, kind, ConstantU32(s, 4));
 	const auto full = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 5));
 	const auto half = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 4));
+	// Node type 6 is the PS5 shared-exponent box; it is not an RDNA2 node type.
+	const auto shared = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 6));
 	const auto bary = Binary(s, spv::OpINotEqual, b, and_bits(words[3], 0x01000000), ConstantU32(s, 0));
 	const auto sort = Binary(s, spv::OpINotEqual, b, and_bits(words[1], 0x80000000), ConstantU32(s, 0));
 	const auto grow = and_bits(shr(words[1], 23), 0xff);
@@ -273,7 +394,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto require = [&](uint32_t condition) {
 		valid = Binary(s, spv::OpLogicalAnd, b, valid, condition);
 	};
-	require(Binary(s, spv::OpULessThanEqual, b, kind, ConstantU32(s, 5)));
+	require(Binary(s, spv::OpULessThanEqual, b, kind, ConstantU32(s, 6)));
 	require(Binary(s, spv::OpULessThanEqual, b, last_index, DeviceAddressFromWords(s, words[2], and_bits(words[3], 0x3ff))));
 	require(Binary(s, spv::OpULessThan, b, last_address, ConstantDeviceAddress(s, uint64_t{1} << 48)));
 	require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, extent)));
@@ -309,7 +430,24 @@ void DefineBvhIntersect(EmitterState& s) {
 			const auto tri_exit = s.current_label;
 			s.builder.AddFunction(spv::OpBranch, merge);
 			EmitLabel(s, box_label);
-			const auto box_value = Boxes(s, first, second, half, grow, sort, extent, origin, inverse);
+			// The node's own layout decides: a type-6 node keeps its children and bounds here, a
+			// type-4/5 node keeps pointers here and its bounds here or in the following block.
+			const auto shared_label = s.builder.AllocateId(), plain_label = s.builder.AllocateId();
+			const auto box_merge = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpSelectionMerge, box_merge, spv::SelectionControlMaskNone);
+			s.builder.AddFunction(spv::OpBranchConditional, shared, shared_label, plain_label);
+			EmitLabel(s, shared_label);
+			const auto shared_value = Boxes6(s, first, grow, sort, extent, origin, inverse);
+			const auto shared_exit = s.current_label;
+			s.builder.AddFunction(spv::OpBranch, box_merge);
+			EmitLabel(s, plain_label);
+			const auto plain_value = Boxes(s, first, second, half, grow, sort, extent, origin, inverse);
+			const auto plain_exit = s.current_label;
+			s.builder.AddFunction(spv::OpBranch, box_merge);
+			EmitLabel(s, box_merge);
+			const auto box_value = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpPhi, vec4, box_value, shared_value, shared_exit,
+			                      plain_value, plain_exit);
 			const auto box_exit = s.current_label;
 			s.builder.AddFunction(spv::OpBranch, merge);
 			EmitLabel(s, merge);
