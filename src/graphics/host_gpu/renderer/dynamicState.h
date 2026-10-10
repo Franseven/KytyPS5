@@ -14,6 +14,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class CommandRecorder;
 
 struct StencilOps {
 	vk::StencilOp fail_op {};
@@ -52,6 +53,8 @@ struct DynamicState {
 		bool stencil_back_write_mask    : 1;
 		bool stencil_back_compare_mask  : 1;
 
+		bool cull_mode             : 1;
+		bool front_face            : 1;
 		bool blend_constants       : 1;
 		bool color_write_enables   : 1;
 		bool line_width            : 1;
@@ -86,14 +89,17 @@ struct DynamicState {
 	uint32_t   stencil_back_write_mask {};
 	uint32_t   stencil_back_compare_mask {};
 
+	vk::CullModeFlags                                  cull_mode {};
+	vk::FrontFace                                      front_face {};
 	std::array<float, 4>                               blend_constants {};
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
 	uint32_t                                           num_color_write_enables {};
 	float                                              line_width {};
 	vk::ImageAspectFlags                               feedback_loop_aspects {};
 
-	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	/// Commits the dynamic state to the provided command buffer. The recorder is the one the draw
+	/// paths already hold: with the recording thread it queues the calls instead of recording them.
+	void Commit(const GraphicContext& graphics, const CommandRecorder& cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
@@ -242,6 +248,20 @@ struct DynamicState {
 		if (line_width != width) {
 			line_width             = width;
 			dirty_state.line_width = true;
+		}
+	}
+
+	void SetCullMode(const vk::CullModeFlags mode) {
+		if (cull_mode != mode) {
+			cull_mode             = mode;
+			dirty_state.cull_mode = true;
+		}
+	}
+
+	void SetFrontFace(const vk::FrontFace face) {
+		if (front_face != face) {
+			front_face             = face;
+			dirty_state.front_face = true;
 		}
 	}
 

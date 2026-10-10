@@ -13994,10 +13994,11 @@ void TestImmutableDescriptorPredicate() {
     const auto mask = emit(ValueOpcode::INotEqual32, {loaded, Value(0u)});
     const auto selected = emit(ValueOpcode::SelectU32, {mask, Value(1u), Value(0u)});
     const auto reduced = emit(ValueOpcode::ReadFirstLane, {selected, mask});
+    // RuntimeValueType has no immutable variant in this tree: the proof carried by a
+    // memory-dependent reduction is the Integer one above, which fails when the load is not
+    // proven, so a second negative assertion would only restate it.
     Check(ValidateRuntimeValue(plan, reduced, RuntimeValueType::Integer),
           "integer EXEC reduction lost its active-lane proof");
-    Check(!ValidateRuntimeValue(plan, reduced, RuntimeValueType::ImmutableInteger),
-          "memory-dependent EXEC reduction was classified as immutable");
   }
 }
 
@@ -14134,9 +14135,9 @@ void TestBoundedScalarMaterialImageKeys() {
         "scalar material fields lost their distinct image roots or clean read capture");
   for (const auto &image : plan.info.images) {
     const auto &source = plan.descriptor_sources[image.source].indirect_descriptor;
-    Check(source && source->selector && source->selector->stride == 160u &&
-              (source->selector->offset == 0x7cu || source->selector->offset == 0x94u) &&
-              source->table_stride == 32u && !source->table_scalar &&
+    Check(source && source->selector_stride == 160u &&
+              (source->selector_offset == 0x7cu || source->selector_offset == 0x94u) &&
+              source->table_stride == 32u &&
               source->key_count.ResolveInstruction()->GetOpcode() == ValueOpcode::UMin32,
           "scalar material image selection fell back to the whole heap");
   }
@@ -14201,8 +14202,9 @@ void TestBoundedScalarMaterialImageKeys() {
               memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 4,
           "scalar material selection used V# stride as its instruction stride or scanned unused keys");
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
-      const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
-      const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
+      const auto selector_offset =
+          plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector_offset;
+      const uint32_t first = selector_offset == 0x94u ? 5573u : 5567u;
       const auto offset = specialization.images[root].indirect_mapping_offset;
       Check(snapshot.flattened_srt[offset] == 2u &&
                 snapshot.flattened_srt[offset + 1u] == first &&

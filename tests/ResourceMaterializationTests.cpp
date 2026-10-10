@@ -32,8 +32,8 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   return *result;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address,
-                                                       bool buffer = false) {
+Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address,
+                                                         bool buffer = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -69,7 +69,13 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address,
   source.dwords[1] = Value(0u);
   source.dword_count = 2;
   program.descriptor_sources.push_back(source);
-  return ExtractResourcePlan(program);
+  return program;
+}
+
+// The same program, after the resource pass has flattened its reads.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address,
+                                                           bool buffer = false) {
+  return ExtractResourcePlan(SrtProgram(address, buffer));
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
@@ -284,11 +290,11 @@ void TestSrtAliasesRetainReadPolicy() {
               inst.GetOpcode() != ValueOpcode::GetSrtResource,
           "retained plan still contains flattened-read aliases");
   }
-  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value &&
-            plan.srt_reads[0].value.Instruction()->Flags<SrtReadFlags>().clean == 1u &&
-            plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
-            plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
-        "alias normalization lost read identity or retained discarded EXEC provenance");
+  // A retained read carries MemoryFlags {index, pc} here, not upstream's clean bit, so only the
+  // identity half of the original assertion has an equivalent: the read-policy half is expressed
+  // by the strict/ordinary read counts checked below.
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value,
+        "alias normalization lost read identity");
   struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
   const SrtRuntime runtime{
       .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
@@ -314,7 +320,7 @@ void TestSrtAliasesRetainReadPolicy() {
   DescriptorValue descriptor;
   {
     SrtWalker clean(plan, CleanRuntime(runtime));
-    SrtWalker walker(plan, runtime, &clean);
+    SrtWalker walker(plan, runtime, {}, &clean);
     Check(walker.RefreshFlatBuffer(flat) &&
               flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
               walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x1111u &&
@@ -327,7 +333,7 @@ void TestSrtAliasesRetainReadPolicy() {
   no_reader.read_specialization_memory = nullptr;
   {
     SrtWalker clean(plan, CleanRuntime(no_reader));
-    Check(!SrtWalker(plan, no_reader, &clean).RefreshFlatBuffer(flat),
+    Check(!SrtWalker(plan, no_reader, {}, &clean).RefreshFlatBuffer(flat),
           "strict flat read accepted a missing strict reader");
   }
   Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor) &&
@@ -336,7 +342,7 @@ void TestSrtAliasesRetainReadPolicy() {
   reads.dirty = true;
   {
     SrtWalker clean(plan, CleanRuntime(runtime));
-    Check(!SrtWalker(plan, runtime, &clean).RefreshFlatBuffer(flat) &&
+    Check(!SrtWalker(plan, runtime, {}, &clean).RefreshFlatBuffer(flat) &&
               reads.strict == 3 && reads.ordinary == 3,
           "dirty strict pointer fell back to an ordinary read");
   }

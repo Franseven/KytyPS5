@@ -431,16 +431,16 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		if (!rect_list && mode.cull_front) {
 			cull_mode |= vk::CullModeFlagBits::eFront;
 		}
-		vk_buffer.setCullMode(cull_mode);
-		vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eClockwise
-		                                 : vk::FrontFace::eCounterClockwise);
+		dynamic_state.SetCullMode(cull_mode);
+		dynamic_state.SetFrontFace(mode.face ? vk::FrontFace::eClockwise
+		                                     : vk::FrontFace::eCounterClockwise);
 #if !defined(__APPLE__)
 		// Without a depth attachment the static pipeline had no depth/stencil state at all.
 		const bool bounds_test =
 		    depth.depth_bounds_test_enable && rendering.depth_stencil_attachment.has_depth;
-		vk_buffer.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
+		dynamic_state.SetDepthBoundsTestEnabled(bounds_test);
 		if (bounds_test) {
-			vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+			dynamic_state.SetDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
 		}
 #endif
 	}

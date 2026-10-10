@@ -864,15 +864,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	const auto texture_size = static_cast<uint32_t>(desc.info.data.size);
 	if (use_cache) {
 		if (cache.size() >= 65536) {
 			cache.clear();
 		}
-		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
+		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, texture_size,
 		                                     shader_conversion});
 	}
 	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
-	                           pixel_format, view_format, size.size);
+	                           pixel_format, view_format, texture_size);
 }
 
 // ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
