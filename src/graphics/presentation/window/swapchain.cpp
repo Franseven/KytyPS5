@@ -455,7 +455,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -480,6 +480,10 @@ private:
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
+	// Tick of the submit that waits on m_image_acquired[i], so the next acquire with that same
+	// semaphore can wait for it: the semaphore must have no pending operation when it is passed
+	// to vkAcquireNextImageKHR again (VUID-vkAcquireNextImageKHR-semaphore-01779).
+	std::vector<uint64_t>          m_frame_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
@@ -660,6 +664,7 @@ void Swapchain::Create() {
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
 	m_render_complete.resize(m_images.size());
+	m_frame_ticks.resize(m_images.size(), 0);
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
@@ -728,6 +733,7 @@ void Swapchain::Destroy() {
 	m_image_views.clear();
 	m_image_acquired.clear();
 	m_render_complete.clear();
+	m_frame_ticks.clear();
 }
 
 void Swapchain::Recreate(bool surface_lost) {
@@ -752,9 +758,16 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	// The semaphore for this slot was handed to the submit of an earlier frame. Re-acquiring with
+	// it while that submit is still pending is a Vulkan error (VUID-...-01779), and the tick is
+	// the only handle on it we keep.
+	if (m_frame_ticks[m_frame_index] != 0) {
+		scheduler.Wait(m_frame_ticks[m_frame_index]);
+		m_frame_ticks[m_frame_index] = 0;
+	}
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
@@ -1023,7 +1036,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                 = scheduler.Submit(submit);
+	m_frame_ticks[m_frame_index]    = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -1170,9 +1185,13 @@ void Presenter::Impl::Present() {
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	// Which of the two steps failed is the whole story when the window freezes, and LOGF is
+	// emptied by --printf-direction Silent, so it would be invisible exactly when it is needed.
+	auto last_status = Swapchain::Status::Success;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
+			last_status = status;
 			RecoverSwapchain(status);
 			continue;
 		}
@@ -1203,6 +1222,7 @@ void Presenter::Impl::Present() {
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
+			last_status = status;
 			RecoverSwapchain(status);
 			continue;
 		}
@@ -1211,7 +1231,12 @@ void Presenter::Impl::Present() {
 		window.UpdateTitle();
 		return;
 	}
-	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	static std::atomic<uint32_t> retry_exhausted_log {0};
+	if (retry_exhausted_log.fetch_add(1, std::memory_order_relaxed) < 16) {
+		printf("Vulkan presentation retry exhausted; dropping frame (last status %u)\n",
+		       static_cast<uint32_t>(last_status));
+		fflush(stdout);
+	}
 }
 
 void Presenter::Discard(Frame& frame) {
