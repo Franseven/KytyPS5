@@ -893,6 +893,14 @@ static int32_t GsUserSgprAt(uint32_t location) {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// The packet decoded just before this one. The trailing-dword path below closes the buffer, and
+	// the only way to tell "the buffer really ended" from "a length was misread and the rest of the
+	// buffer is being thrown away" is to know what preceded it: without this, a stall that follows
+	// those lines has no evidence either way.
+	uint32_t last_header = 0;
+	uint32_t last_opcode = 0;
+	uint32_t last_offset = 0;
+
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -924,13 +932,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			// it and end the buffer rather than lose a run that has already drawn its frames.
 			static std::atomic<uint32_t> tail_log_count {0};
 			if (tail_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				printf("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32 "\n", packet[0],
-				       total_dw - remaining_dw);
+				// remaining_dw is 1 here by construction, so print what actually differs between the
+				// two readings: how much of the buffer is left behind, and the packet that came before
+				// the dword that ended it.
+				printf("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32
+				       " remaining=%" PRIu32 " total=%" PRIu32 " last=0x%08" PRIx32
+				       " last_opcode=%" PRIu32 " last_offset=0x%05" PRIx32 "\n",
+				       packet[0], total_dw - remaining_dw, remaining_dw, total_dw, last_header,
+				       last_opcode, last_offset);
 			}
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
 		}
+
+		last_header = packet_header;
+		last_opcode = opcode;
+		last_offset = cursor.offset_dw;
 
 		if ((packet_header >> 30u) == 0u) {
 			// A type-0 packet writes COUNT+1 registers from a base index; the command processor
@@ -1028,7 +1046,38 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		TelemetryAddPm4Op(static_cast<uint8_t>(opcode & 0xFFu),
 		                  TelemetryNowUs() - telemetry_packet_begin_us);
-		EXIT_IF(packet_dw > remaining_dw);
+		if (packet_dw > remaining_dw) {
+			// The handler asked for more dwords than the buffer holds: either the guest left its
+			// last packet truncated, or an earlier length was misread and the cursor has drifted.
+			// Dying loses a run that has already drawn frames, which is the same bargain the
+			// trailing-dword path above makes, so end the buffer instead of the process.
+			//
+			// The two lengths tell the two cases apart: when the header's own LEN field also
+			// overruns, the guest wrote a short buffer; when only the handler's return does, the
+			// handler and the header disagree and the cursor was already wrong.
+			static std::atomic<uint32_t> overrun_log_count {0};
+			if (overrun_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				const auto offset = total_dw - remaining_dw;
+				printf("CP: packet overruns the buffer: op=0x%02" PRIx32
+				       " r=0x%02" PRIx32 " header=0x%08" PRIx32 " len=%" PRIu32
+				       " len_header=%" PRIu32 " remaining=%" PRIu32 " offset=0x%05" PRIx32
+				       " total=%" PRIu32 " last=0x%08" PRIx32 " last_opcode=%" PRIu32
+				       " last_offset=0x%05" PRIx32 "\n",
+				       opcode, KYTY_PM4_R(packet_header), packet_header, packet_dw,
+				       KYTY_PM4_LEN(packet_header), remaining_dw, offset, total_dw, last_header,
+				       last_opcode, last_offset);
+				const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+				const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+				auto* const base       = packet - offset;
+				for (uint32_t i = dump_begin; i < dump_end; i++) {
+					printf("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "),
+					       base[i]);
+				}
+			}
+			cursor.offset_dw = total_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
 		if (execution.m_suspended) {
 			return;
 		}
