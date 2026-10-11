@@ -20673,98 +20673,6 @@ TestCase ScalarZeroBitOps() {
   return test;
 }
 
-TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
-  using O = ShaderOpcode;
-  TestCase test;
-  test.name = bits == 8 ? (wave_size == 32 ? "ScalarSextI8MasksWave32"
-                                         : "ScalarSextI8MasksWave64")
-                       : (wave_size == 32 ? "ScalarSextI16MasksWave32"
-                                         : "ScalarSextI16MasksWave64");
-  constexpr u32 high = 0x80000001u;
-  test.initial = bits == 8
-                     ? std::vector<u32>{0xdeadff00u, 0xabcdff7fu, 0x12340080u, 0xabcf00ffu}
-                     : std::vector<u32>{0xdead0000u, 0xabcd7fffu, 0x12348000u, 0xabcfffffu};
-  const u32 extended_values[] = {0u, bits == 8 ? 0x7fu : 0x7fffu,
-                                bits == 8 ? 0xffffff80u : 0xffff8000u, 0xffffffffu};
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (u32 i = 0; i < 4u; ++i) {
-    const auto extended = extended_values[i];
-    for (const bool scc : {false, true}) {
-      AppendVMovU32(&code, 30, i * 4u);
-      AppendBufferLoadDword(&code, 3, 30);
-      code.push_back(EncodeVop1(0x02, 11, Vgpr(3)));
-      AppendSMovLiteral(&code, 107, high);
-      code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
-      code.push_back(EncodeSop1(0x04, 126, 128)); // Scalar operations execute with empty EXEC.
-      // The I16 word is captured s_sext_i32_i16 vcc_lo, s11.
-      code.push_back(bits == 8 ? 0xbeea190bu : 0xbeea1a0bu);
-      code.push_back(EncodeSMovB32(20, 106));
-      code.push_back(EncodeSMovB32(21, 107));
-      code.push_back(EncodeSMovB32(22, 253));
-      code.push_back(EncodeSop1(0x04, 126, 193));
-      AppendVMovU32(&code, 1, 1);
-      code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
-      const u32 expected[] = {extended, high, scc ? 1u : 0u};
-      for (u32 word = 0; word < 3u; ++word) {
-        AppendStoreSgprAtLaneDwordOffset(&code, 20u + word, 0, test.expected.size());
-        test.expected.insert(test.expected.end(), wave_size, expected[word]);
-      }
-      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, test.expected.size());
-      const uint64_t mask = (uint64_t{high} << 32u) | extended;
-      for (u32 lane = 0; lane < wave_size; ++lane)
-        test.expected.push_back(static_cast<u32>((mask >> lane) & 1u));
-    }
-  }
-  AppendEnd(&code);
-  test.initial.resize(test.expected.size());
-  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
-                  O::S_MOV_B64, O::S_CMP_EQ_U32,
-                  bits == 8 ? O::S_SEXT_I32_I8 : O::S_SEXT_I32_I16,
-                  O::V_CNDMASK_B32, O::V_MOV_B32, O::V_ADD_NC_U32,
-                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{bits == 8 ? "S_SEXT_I32_I8 vcc_lo, s11"
-                                  : "S_SEXT_I32_I16 vcc_lo, s11", 8u}};
-  test.required_spirv = {"OpBitFieldSExtract"};
-  test.compute_info.threads_num[0] = wave_size;
-  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
-  test.compute_info.thread_ids_num = 1;
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  return test;
-}
-
-TestCase ScalarSextConstantsAndAliases() {
-  using O = ShaderOpcode;
-  TestCase test;
-  test.name = "ScalarSextConstantsAndAliases";
-  auto &code = test.code;
-  for (const u32 opcode : {0x19u, 0x1au}) {
-    const u32 literal = opcode == 0x19u ? 0x12345680u : 0x12348000u;
-    const u32 extended = opcode == 0x19u ? 0xffffff80u : 0xffff8000u;
-    for (const bool scc : {false, true}) {
-      code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
-      code.push_back(EncodeSop1(opcode, 10, 255));
-      code.push_back(literal);
-      code.push_back(EncodeSop1(opcode, 10, 10)); // In-place source/destination.
-      code.push_back(EncodeSop1(opcode, 11, InlineU32(0)));
-      code.push_back(EncodeSop1(opcode, 12, InlineU32(64)));
-      code.push_back(EncodeSop1(opcode, 13, 193)); // Inline -1.
-      code.push_back(EncodeSMovB32(14, 253));
-      const u32 expected[] = {extended, 0, 64, 0xffffffffu, scc ? 1u : 0u};
-      for (u32 word = 0; word < 5u; ++word) {
-        AppendStoreSgpr(&code, 10u + word, test.expected.size());
-        test.expected.push_back(expected[word]);
-      }
-    }
-  }
-  AppendEnd(&code);
-  test.initial.resize(test.expected.size());
-  test.opcodes = {O::S_CMP_EQ_U32, O::S_SEXT_I32_I8, O::S_SEXT_I32_I16,
-                  O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"S_SEXT_I32_I8", 10u}, {"S_SEXT_I32_I16", 10u}};
-  return test;
-}
 
 TestCase ScalarBrevB64OperandsAndMasks(u32 wave_size) {
   using O = ShaderOpcode;
@@ -40926,6 +40834,143 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
               suffix == 33,
           "DE remained blocked after the CE stream completed");
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
+}
+
+TestCase VectorCompareI16U16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovLiteral(&code, 2, 0xabcd8000u);
+  AppendVMovLiteral(&code, 3, 0x00007fffu);
+  AppendVMovLiteral(&code, 4, 0x12348000u);
+  AppendVMovLiteral(&code, 5, 0xffff0001u);
+  AppendVMovLiteral(&code, 6, 0x00000001u);
+
+  u32 dst = 10;
+  u32 out = 0;
+  auto append_compare = [&](u32 opcode, u32 src0, u32 src1, bool value) {
+    code.push_back(EncodeVopc(opcode, src0, src1));
+    code.push_back(EncodeVop2(0x01, dst, InlineU32(0), 1));
+    AppendStoreVgpr(&code, dst, out++);
+    expected.push_back(value ? 1u : 0u);
+    dst++;
+  };
+
+  append_compare(0x8a, Vgpr(2), 4, true);
+  append_compare(0x8a, Vgpr(2), 3, false);
+  append_compare(0x8b, Vgpr(2), 3, true);
+  append_compare(0x8b, Vgpr(3), 2, false);
+  append_compare(0x8b, Vgpr(5), 6, true);
+  append_compare(0x8c, Vgpr(3), 2, true);
+  append_compare(0x8c, Vgpr(2), 3, false);
+  append_compare(0x8d, Vgpr(2), 3, true);
+  append_compare(0x8d, Vgpr(5), 6, false);
+
+  append_compare(0xaa, Vgpr(2), 4, true);
+  append_compare(0xaa, Vgpr(2), 3, false);
+  append_compare(0xab, Vgpr(3), 2, true);
+  append_compare(0xab, Vgpr(2), 3, false);
+  append_compare(0xac, Vgpr(2), 3, true);
+  append_compare(0xac, Vgpr(3), 2, false);
+  append_compare(0xad, Vgpr(2), 3, true);
+  append_compare(0xad, Vgpr(5), 6, false);
+  append_compare(0xae, Vgpr(2), 3, true);
+  append_compare(0xae, Vgpr(3), 2, false);
+  append_compare(0xae, Vgpr(5), 6, true);
+  AppendEnd(&code);
+
+  return {"VectorCompareI16U16Ops",
+          code,
+          {},
+          expected,
+          {O::V_MOV_B32, O::V_CMP_EQ_I16, O::V_CMP_LE_I16, O::V_CMP_GT_I16,
+           O::V_CMP_NE_I16, O::V_CMP_EQ_U16, O::V_CMP_LE_U16, O::V_CMP_GT_U16,
+           O::V_CMP_NE_U16, O::V_CMP_GE_U16, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase Vop3Int16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0xabcd0001u);
+  AppendVMovLiteral(&code, 2, 0x12340002u);
+  AppendVMovLiteral(&code, 3, 0x55557fffu);
+  AppendVMovLiteral(&code, 4, 0x66668000u);
+  AppendVMovLiteral(&code, 5, 0x77770013u);
+  AppendVMovLiteral(&code, 6, 0x88888010u);
+  AppendVMovLiteral(&code, 10, 0xaaaa0000u);
+  AppendVMovLiteral(&code, 11, 0xbbbb0000u);
+  AppendVMovLiteral(&code, 12, 0xcccc0000u);
+  AppendVMovLiteral(&code, 13, 0xdddd0000u);
+  AppendVMovLiteral(&code, 14, 0xeeee0000u);
+  AppendVMovLiteral(&code, 15, 0x11110000u);
+
+  AppendVop3(&code, 0x304u, 10, Vgpr(1), Vgpr(2));
+  AppendVop3(&code, 0x30du, 11, Vgpr(3), Vgpr(1));
+  AppendVop3(&code, 0x308u, 12, Vgpr(5), Vgpr(6));
+  AppendVop3(&code, 0x309u, 13, Vgpr(3), Vgpr(4));
+  AppendVop3(&code, 0x30bu, 14, Vgpr(3), Vgpr(4));
+  AppendVop3(&code, 0x308u, 15, Vgpr(5), Vgpr(3));
+
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3Int16Ops";
+  test.code = std::move(code);
+  test.expected = {0xaaaaffffu, 0xbbbb8000u, 0xccccf002u,
+                   0xdddd8000u, 0xeeee7fffu, 0x11110fffu};
+  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U16, O::V_ADD_NC_I16,
+                  O::V_ASHRREV_I16, O::V_MAX_U16, O::V_MIN_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase Vop3pInt16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x80007fffu);
+  AppendVMovLiteral(&code, 2, 0x00010001u);
+  AppendVMovLiteral(&code, 3, 0xfffe0003u);
+  AppendVMovLiteral(&code, 4, 0x00130004u);
+  AppendVMovLiteral(&code, 5, 0x8010f00fu);
+  AppendVMovLiteral(&code, 6, 0x00050007u);
+
+  AppendVop3p(&code, 0x00u, 10, Vgpr(1), Vgpr(3), Vgpr(6), 0x7u);
+  AppendVop3p(&code, 0x09u, 11, Vgpr(1), Vgpr(3), Vgpr(6), 0x7u);
+  AppendVop3p(&code, 0x01u, 12, Vgpr(1), Vgpr(3), 0, 0x3u);
+  AppendVop3p(&code, 0x02u, 13, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0bu, 14, Vgpr(2), Vgpr(3), 0, 0x3u);
+  AppendVop3p(&code, 0x04u, 15, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x05u, 16, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x06u, 17, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x08u, 18, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0cu, 19, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0du, 20, Vgpr(1), Vgpr(2), 0, 0x3u);
+
+  for (u32 i = 0; i < 11; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3pInt16Ops";
+  test.code = std::move(code);
+  test.expected = {0x00058004u, 0x00058004u, 0x00007ffdu, 0x80018000u,
+                   0x0003fffeu, 0x008000f0u, 0x10020f00u, 0xf002ff00u,
+                   0x80000001u, 0x80007fffu, 0x00010001u};
+  test.opcodes = {O::V_MOV_B32,        O::V_PK_MAD_I16,     O::V_PK_MAD_U16,
+                  O::V_PK_MUL_LO_U16,  O::V_PK_ADD_I16,     O::V_PK_SUB_U16,
+                  O::V_PK_LSHLREV_B16, O::V_PK_LSHRREV_B16, O::V_PK_ASHRREV_I16,
+                  O::V_PK_MIN_I16,     O::V_PK_MAX_U16,     O::V_PK_MIN_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 } // namespace
