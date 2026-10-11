@@ -28,6 +28,13 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// Releases the GPU's claim on the range's pages and gives them to the CPU in one critical
+	// section. As two calls the two halves are not atomic: a SynchronizeBuffer on another thread
+	// can mark a page GPU-dirty in between, and RegionManager then exits on "CPU dirty state
+	// conflicts with GPU dirty state" (or the mirror message) over a page that a command still in
+	// flight names. The claim covers whole pages, not just the requested bytes, which is strictly
+	// more than the pair of calls did and costs only redundant uploads.
+	void               TakeGpuPagesForCpu(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
